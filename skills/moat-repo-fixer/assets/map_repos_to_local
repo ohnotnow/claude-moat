@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+#
+# map_repos_to_local — match a GitHub org's repos to their local checkouts.
+#
+# Local project directory names rarely match the GitHub repo name, which makes
+# it awkward to act on a moat report: moat names repos by their GitHub name,
+# but a tool like moat-repo-fixer needs the *local* path to work in. This
+# resolves that gap by reading each checkout's `origin` remote rather than
+# trusting the folder name.
+#
+# Usage:
+#   ./map_repos_to_local <org> [search-dir]
+#
+# Scans the immediate sub-directories of <search-dir> (default: current dir),
+# reads *all* of each one's remotes (not just `origin` — the GitHub remote may
+# be named `github`, e.g. when origin is an on-prem GitLab and GitHub is a
+# backup), and prints a CSV row for every checkout with a remote belonging to
+# <org> on github.com.
+#
+# Output  (stdout): CSV `repo,local_path,current_branch,matched_remote,remote_url`
+# Summary (stderr): one line of counts, plus warnings for duplicate repos.
+#
+# Examples:
+#   ./map_repos_to_local UoGSoE ~/Documents/code
+#   ./map_repos_to_local UoGSoE ~/code > repo_map.csv
+
+set -uo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+map_repos_to_local — match a GitHub org's repos to their local checkouts.
+
+Usage:
+  map_repos_to_local <org> [search-dir]
+
+Scans the immediate sub-directories of <search-dir> (default: current dir),
+reads ALL of each one's remotes (not just origin — the GitHub remote may be
+named `github`, e.g. when origin is an on-prem GitLab and GitHub is a backup),
+and prints a CSV row for every checkout with a remote belonging to <org> on
+github.com.
+
+Output  (stdout): CSV `repo,local_path,current_branch,matched_remote,remote_url`
+Summary (stderr): a counts line, plus warnings for duplicate repos.
+
+Examples:
+  map_repos_to_local UoGSoE ~/Documents/code
+  map_repos_to_local UoGSoE ~/code > repo_map.csv
+EOF
+  exit "${1:-0}"
+}
+
+case "${1:-}" in
+  -h|--help) usage 0 ;;
+esac
+
+org=${1:-}
+search_dir=${2:-.}
+
+if [ -z "$org" ]; then
+  echo "error: missing <org> argument" >&2
+  echo "usage: $(basename "$0") <org> [search-dir]" >&2
+  exit 2
+fi
+[ -d "$search_dir" ] || { echo "error: search dir not found: $search_dir" >&2; exit 2; }
+command -v git >/dev/null 2>&1 || { echo "error: git not found on PATH" >&2; exit 2; }
+
+# CSV-quote: wrap in double quotes and double any internal quotes.
+csv_quote() {
+  local s=${1//\"/\"\"}
+  printf '"%s"' "$s"
+}
+
+shopt -s nocasematch   # GitHub owners are case-insensitive
+shopt -s nullglob      # an empty glob expands to nothing, not a literal '*'
+
+tmp=$(mktemp) || { echo "error: could not create temp file" >&2; exit 2; }
+trap 'rm -f "$tmp"' EXIT
+
+checked=0
+matched=0
+
+for d in "$search_dir"/*/; do
+  d=${d%/}
+  # Treat as a repo if .git is a dir (normal clone) or a file (worktree).
+  [ -d "$d/.git" ] || [ -f "$d/.git" ] || continue
+  checked=$((checked + 1))
+
+  # Inspect *every* remote, not just origin: the github.com remote may be
+  # named `github` (e.g. origin is an on-prem GitLab and GitHub is a backup),
+  # or anything else. We match on the URL, not the remote name.
+  match_repo=""
+  match_remotes=""
+  match_url=""
+  while IFS=' ' read -r key url; do
+    [ -n "$url" ] || continue
+    # Only github.com remotes (enterprise/other hosts are skipped).
+    case "$url" in
+      *github.com[:/]*) : ;;
+      *) continue ;;
+    esac
+    # Reduce the remote URL to owner/repo, then split. Handles both
+    #   git@github.com:OWNER/REPO.git   and   https://github.com/OWNER/REPO(.git)
+    ownerrepo=$(printf '%s' "$url" | sed -E 's#(\.git)?/?$##; s#^.*github\.com[:/]##')
+    owner=${ownerrepo%%/*}
+    repo=${ownerrepo##*/}
+    [ -n "$owner" ] && [ -n "$repo" ] || continue
+    [[ "$owner" == "$org" ]] || continue
+
+    name=${key#remote.}; name=${name%.url}
+    match_repo=$repo
+    match_remotes="${match_remotes:+$match_remotes;}$name"
+    # Prefer origin's URL for display; otherwise keep the first match.
+    if [ "$name" = "origin" ] || [ -z "$match_url" ]; then
+      match_url=$url
+    fi
+  done < <(git -C "$d" config --get-regexp '^remote\..*\.url$' 2>/dev/null)
+
+  [ -n "$match_repo" ] || continue
+
+  abspath=$(cd "$d" && pwd -P)
+  branch=$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+
+  printf '%s,%s,%s,%s,%s\n' \
+    "$match_repo" "$(csv_quote "$abspath")" "$branch" \
+    "$(csv_quote "$match_remotes")" "$(csv_quote "$match_url")" >> "$tmp"
+  matched=$((matched + 1))
+done
+
+# Header, then body sorted by repo name.
+echo "repo,local_path,current_branch,matched_remote,remote_url"
+sort -t, -k1,1 "$tmp"
+
+# Flag any repo that resolved to more than one local directory.
+dupes=$(cut -d, -f1 "$tmp" | sort | uniq -d)
+if [ -n "$dupes" ]; then
+  echo "warning: these repos matched more than one local directory:" >&2
+  printf '  %s\n' $dupes >&2
+fi
+
+echo "checked $checked git repo(s) under $search_dir; matched $matched for org '$org'" >&2

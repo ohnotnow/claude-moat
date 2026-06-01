@@ -7,6 +7,15 @@ description: Apply in-repo security hardening fixes that Laravel's `moat` CLI fl
 
 Walks through the in-repo fixes that moat (https://github.com/laravel/moat) flags. Strictly file-level changes inside the current repository. Settings-level fixes belong to `moat-org-fixer`.
 
+## Choose scope first
+
+Use `AskUserQuestion` up front to find out what the user wants:
+
+- **A — this repo** — action moat's findings for the single repo we're in right now. This is the default when the skill is invoked from inside a repo. Proceed straight to *Source the findings* below.
+- **B — all of an org's repos** — sweep every local checkout of an org's repos and fix them in turn. See *Mode B: every repo in an org* (near the end) for the orchestration; it reuses the per-repo flow once per repo.
+
+Everything from *Source the findings* down to *Mode B* is the **per-repo flow** — used directly in Mode A, and run once per repo in Mode B.
+
 ## Source the findings (preference order)
 
 1. **User-supplied JSON file** — if the user mentions a moat report (e.g. `moat.json`, `moat_report.json`), load it and filter `checks[].affected[]` for entries matching the current repo.
@@ -189,10 +198,46 @@ Preview each workflow's changes (one preview per file, batching all the permissi
 
 `moat` evolves. If the filtered findings include an `id` not handled above, **do not silently skip** — show the user moat's `label`, `description`, `why_enable`, and `how_to_fix` URL, and ask whether they want help with it. If the fix is a file change, work through it with the same preview-then-confirm pattern.
 
+## Mode B: every repo in an org
+
+This sweeps every *local checkout* of an org's repos and applies the per-repo flow to each. It exists because local directory names — and even remote names — drift from the GitHub repo name (a repo's GitHub remote might be `origin`, or `github` when the primary is an on-prem GitLab and GitHub is a backup), so checkouts can't be found by folder name alone.
+
+**1. Gather inputs.** Ask the user for:
+- the **org** name (e.g. `UoGSoE`)
+- the **base path** that holds their project folders (e.g. `~/Documents/code`)
+
+**2. Build the repo → local-path map.** Run the bundled resolver — it reads *every* remote of every immediate sub-directory and matches on the github.com URL, not the folder name. It lives under this skill's base directory (shown when the skill loads); invoke via `bash` so it works regardless of the exec bit:
+```
+bash <skill-dir>/assets/map_repos_to_local <org> <base-path>
+```
+It prints CSV `repo,local_path,current_branch,matched_remote,remote_url` to stdout, plus a counts line and any duplicate-repo warnings to stderr. Capture stdout.
+
+**3. Source the org's findings** (same preference order as Mode A, at org scope): if the user has a recent moat **report**, use it; otherwise offer to run `moat --format json <org>`. Keep only the **file-level** findings this skill owns — `repositories_workflow_actions_are_pinned`, `repositories_workflow_permissions_are_restricted`, `repositories_have_security_policy`, `repositories_have_dependabot_config`. Settings-level findings belong to `moat-org-fixer`: name them in the summary but don't act on them here.
+
+**4. Join findings to checkouts.** For each flagged repo, look it up in the map and bucket it:
+- **one local checkout** → queue for fixing
+- **no local checkout** → "clone needed" (list at the end; never clone automatically)
+- **more than one checkout** (the dupe warning) → show the candidate paths and **ask the user which one** before queuing
+
+**5. Fix each queued repo, one at a time.** For each, in turn:
+- `cd` into its `local_path`.
+- **Check the working tree first.** Show the repo's `current_branch` and `git status --porcelain`. If it's on a non-default branch or has uncommitted changes, **surface that and ask** whether to (a) fix here anyway, (b) skip this repo, or (c) stop the sweep. Never edit a dirty or feature-branch checkout silently.
+- Run the **per-repo flow above** for that repo, scoping the findings to that repo's entries (you already have them from step 3 — don't re-run moat per repo). The `SECURITY.md` org-default pre-check still applies — and in an org sweep there's very likely an org default, so expect to recommend skipping the per-repo file.
+- Honour every guardrail: one fix at a time, preview → confirm → apply, never a git mutation.
+
+**6. Closing summary (org sweep).** On top of the per-repo summaries, give an org-level roll-up:
+- **Fixed** — repo → which files changed.
+- **Skipped** — repo + reason (dirty tree, on a feature branch, user declined).
+- **Clone needed** — flagged repos with no local checkout.
+- **Ambiguous** — repos with multiple checkouts, and which path you used.
+- **Settings-level (for `moat-org-fixer`)** — the org/settings findings you deliberately left alone.
+- **Commit/push is the user's job** — an org sweep leaves uncommitted changes across many working trees. Remind them clearly; you never run git.
+
 ## Guardrails
 
 - Never run git mutations (`add`, `commit`, `push`, `checkout`, `reset`, `restore`, etc.).
 - Never bulk-apply across fix categories. One category at a time, one file at a time across categories.
+- In **Mode B** (org sweep), also work one *repo* at a time — finish or skip a repo before moving to the next; never fan out edits across repos.
 - **Within a single file**, batch multiple changes of the same kind into one preview and apply in one pass. Don't make the user confirm 11 nearly-identical line edits in one workflow.
 - Always show a preview before writing — `diff -u` against a temp file for modifications, a fenced code block for new files.
 - Already-correct items get skipped silently — don't rewrite a workflow file just to touch it.
@@ -200,7 +245,7 @@ Preview each workflow's changes (one preview per file, batching all the permissi
 
 ## After all fixes
 
-Print a structured summary with **all** of the following sections — don't skip any, even when empty:
+Print a structured summary with **all** of the following sections — don't skip any, even when empty. (In **Mode B**, this is the per-repo summary; Mode B's step 6 rolls these up across the org.)
 
 1. **Files changed** — list each path that was written, with a one-line note on what changed.
 2. **Skipped / deferred** — anything you didn't do and why (e.g. "action X is archived, recommended replacing before pinning").
