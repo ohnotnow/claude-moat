@@ -116,6 +116,30 @@ For every `.github/workflows/*.yml`:
 
 ### Fix: `repositories_have_security_policy`
 
+**First, check for an org-wide default — before writing anything.** GitHub serves a default `SECURITY.md` to *every* repo in an org from a special `<owner>/.github` repository (it appears in each repo's Security tab automatically). Many developers — and moat itself — don't know this exists, so the real risk here is **drift**: adding a redundant per-repo file that overrides a perfectly good org default. `<owner>` comes from `git remote get-url origin`; check the canonical locations:
+
+```
+for p in SECURITY.md .github/SECURITY.md docs/SECURITY.md; do
+  gh api "/repos/<owner>/.github/contents/$p" --jq .html_url 2>/dev/null && break
+done
+```
+
+Belt-and-braces, this shows what GitHub *actually serves* to the current repo — a non-null URL on a repo moat flagged means an inherited default is already in play:
+
+```
+gh api /repos/<owner>/<repo>/community/profile --jq '.files.security_policy.html_url'
+```
+
+**If an org-wide default exists**, surface it instead of silently writing a file:
+
+> This repo has no `SECURITY.md` of its own — **but** your org already provides a default via `<owner>/.github` (`<url>`), which already covers this repo's Security tab. Adding a repo-specific file would override that and start exactly the drift we want to avoid. moat flags this anyway because it only reads *this repo's* own contents (a known false-positive when an org default exists). Want to (a) leave it to the org default — recommended — or (b) add a repo-specific `SECURITY.md` because this repo genuinely needs different contact/policy details?
+
+Only write a file if the user picks (b). Otherwise record it under "Skipped / deferred" with the reason ("covered by org-wide default at `<url>`") and move on.
+
+**If there's no org default and you're hardening several repos**, mention the DRY alternative: a single `SECURITY.md` in a new `<owner>/.github` repo covers them all at once — that's `moat-org-fixer` territory and usually beats N per-repo files.
+
+**To write a repo-specific file** (no org default, or the user chose (b)):
+
 1. Get suggested name and email from the user's git config:
    ```
    git config user.name
@@ -130,14 +154,16 @@ For every `.github/workflows/*.yml`:
 
 ### Fix: `repositories_workflow_permissions_are_restricted`
 
-Two routes:
-- **Org-level** (single setting → fixes all repos at once) — belongs to `moat-org-fixer`. Mention this to the user and recommend it as the better long-term fix, but don't do it here.
-- **Per-workflow** (in scope here) — add at the top of each `.github/workflows/*.yml`:
-  ```yaml
-  permissions:
-    contents: read
-  ```
-  If a workflow legitimately needs more, keep the grant as narrow as possible and add a one-line comment explaining why.
+**This finding is fixed only at the file level — there is no settings shortcut.** moat checks each workflow file for an explicit, minimal `permissions:` block. A common misconception (corrected after a real run) is that the org-wide default-token setting in `moat-org-fixer` clears this "for all repos at once" — it does **not**. That setting addresses a *different* finding (`repositories_actions_workflow_token_is_read_only`) and leaves this count untouched. Keep it as a complementary safety net, but the only thing that clears *this* finding is editing the files.
+
+Add a top-level block to each `.github/workflows/*.yml`:
+
+```yaml
+permissions:
+  contents: read
+```
+
+If a workflow legitimately needs more, keep the grant as narrow as possible and add a one-line comment explaining why.
 
 **Common actions that need elevated permissions** (use this as a starting point — verify against the action's current docs if unsure, and prefer the narrowest grant):
 
@@ -181,5 +207,5 @@ Print a structured summary with **all** of the following sections — don't skip
 3. **Out-of-scope findings (for `moat-org-fixer`)** — explicitly list every moat finding for this repo whose fix is a setting rather than a file. The user needs to see the *remaining* work, not just what was done. For each: the finding's `label` and the matching repo entry from `affected[]`.
 4. **Next steps**:
    - The user needs to commit and push these changes themselves (you don't do git).
-   - For the workflow token permission specifically, the org-level fix in `moat-org-fixer` is one setting that cascades to all repos — they may prefer to defer the per-workflow fix and do that instead.
+   - The org-level default-token fix in `moat-org-fixer` cascades to all repos and clears `repositories_actions_workflow_token_is_read_only` in one go — recommend it as a complementary safety net. But it does **not** clear `repositories_workflow_permissions_are_restricted` (the per-workflow `permissions:` block we fixed here): the two are different findings, so don't suggest deferring the file fix in favour of the org setting.
 5. **Re-verify (optional)** — offer to re-run `moat --format json <owner>/<repo>` after the user has pushed. Be honest about the caveat: file-level checks (`workflow_actions_are_pinned`, `workflow_permissions_are_restricted`, `have_security_policy`, `have_dependabot_config`) should flip locally after push; anything that reads GitHub-side state (branch protection, org policy) won't change until the matching settings are also updated.

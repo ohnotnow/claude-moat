@@ -17,6 +17,8 @@ Same preference order as `moat-repo-fixer`:
    moat --format json <account>
    ```
    **Always pass `--format json`** — without it moat writes ANSI-coloured terminal output that's painful to parse.
+
+   **`moat` exits non-zero when any check fails.** Don't chain it with `&&` — `moat … && jq …` silently skips the parse step because moat "failed". Redirect to a file as its own statement, then parse: `moat --format json <account> > /tmp/moat.json; jq … /tmp/moat.json`.
 3. **Fallback** — `moat` isn't installed: point the user at https://github.com/laravel/moat. Don't fabricate a checklist.
 
 ## Step 1: Auth pre-flight (before anything else)
@@ -75,7 +77,7 @@ Order matters — do the highest-leverage fixes first because they invalidate do
 3. **Per-repo settings** that may have been resolved by step 1 — re-run moat between groups
 4. **Per-resource changes** (e.g. remove specific collaborator from specific repo)
 
-After applying step 1 fixes, **suggest re-running `moat --format json <org>`** to refresh the picture before grinding through per-repo work. A bunch of per-repo `workflow_permissions_are_restricted` failures may simply disappear.
+After applying step 1 fixes, **suggest re-running `moat --format json <org>`** to refresh the picture before grinding through per-repo work — and let the re-scan tell you what *actually* cleared rather than assuming. Beware one common false hope: the org-wide workflow-token change clears `repositories_actions_workflow_token_is_read_only`, but it does **not** clear `repositories_workflow_permissions_are_restricted` — moat checks that one at the workflow-*file* level, so no org/repo *setting* will move it (see the trap in Step 4.5).
 
 ## Step 4.5: Known traps and friction warnings
 
@@ -101,7 +103,9 @@ If moat's `description` or `why_enable` text contains its own caveats, surface t
 | `organization_requires_two_factor` via REST PATCH | Returns 200, value unchanged. **UI-only via REST.** Don't attempt PATCH — flag as UI follow-up immediately. |
 | `/orgs/<org>/actions/permissions/workflow` with PATCH | Returns 404. Use **PUT with the full body** — endpoint isn't a partial-update. |
 | `repositories_releases_are_immutable` | No REST endpoint at all. UI-only. |
-| Org defaults flipping FAIL → WARN after enabling toggles | After flipping the simple `secret_scanning_enabled_for_new_repositories` / push protection / dependabot toggles, moat will often re-report as WARN: "default policy missing". This is moat checking for a **formal Advanced Security Configuration** (the `security_products` settings page) — a *separate* thing from the simple toggle, and UI-only. Surface explicitly: "The WARN is expected and points at separate UI work." Don't let a fresh agent think they failed. |
+| Org defaults flipping FAIL → WARN after enabling toggles | After flipping the simple `secret_scanning_enabled_for_new_repositories` / push protection / dependabot toggles, moat will often re-report as WARN: "default policy missing". This is moat checking for a **formal Advanced Security Configuration** (the `security_products` settings page) — a *separate* thing from the simple toggle, and UI-only. Surface explicitly: "The WARN is expected and points at separate UI work." Completing that UI config *does* clear these to pass (confirmed on a real run). Don't let a fresh agent think they failed. |
+| `repositories_workflow_permissions_are_restricted` "shrinking" after the org token change | It usually **doesn't**. moat checks each workflow file's `permissions:` block, not the repo/org default-token setting, so the org-wide `actions/permissions/workflow` PUT (and its per-repo equivalent) leaves this count untouched — they move a *different* axis (`repositories_actions_workflow_token_is_read_only`). This finding is genuinely file-level → `moat-repo-fixer`. (Seen for real: an org token change left a 28-repo count completely unchanged.) |
+| Org-wide default `SECURITY.md` (a `<org>/.github` repo) | Makes every repo *display* a policy in its Security tab — genuinely useful — but moat's `repositories_have_security_policy` reads each repo's **own** contents and still flags all of them. The org default will not move that finding. Tell the user the protection is real either way; if they want the green tick it's a per-repo file → `moat-repo-fixer`. |
 
 ### Plan-tier limitations
 
@@ -159,9 +163,9 @@ gh api -X PUT /orgs/<org>/actions/permissions/workflow \
   -F can_approve_pull_request_reviews=false
 ```
 
-**This endpoint is PUT-only with the full body.** PATCH returns 404. The two `-F` flags above *are* the full body — there are no other fields on this endpoint.
+**This endpoint is PUT-only with the full body.** PATCH returns 404. The two `-F` flags above *are* the full body — there are no other fields on this endpoint. **The PUT returns an empty body on success** — that's not an error; confirm with a follow-up `GET /orgs/<org>/actions/permissions/workflow`.
 
-Tell the user this may also clear per-repo `workflow_permissions_are_restricted` failures.
+This clears `repositories_actions_workflow_token_is_read_only` for every repo that inherits the org default. It does **not** clear `repositories_workflow_permissions_are_restricted` — that's a file-level check (the workflow's own `permissions:` block) and no token *setting* touches it. Don't promise the user it will.
 
 #### `repositories_secret_scanning_is_enabled` / `repositories_secret_push_protection_is_enabled`
 
@@ -186,9 +190,30 @@ gh api -X PATCH /orgs/<org> \
   -F dependabot_security_updates_enabled_for_new_repositories=true
 ```
 
+#### `repositories_private_vulnerability_reporting_is_enabled`
+
+Per-repo, with a clean REST endpoint. moat usually reports this as "enabled by default org-wide, but N repos override it" — so the fix is per-repo on the named repos:
+
+```
+# Current
+gh api /repos/<owner>/<repo>/private-vulnerability-reporting    # -> {"enabled": false|true}
+
+# Enable
+gh api -X PUT /repos/<owner>/<repo>/private-vulnerability-reporting
+
+# Disable (per GitHub's REST docs — rarely needed)
+gh api -X DELETE /repos/<owner>/<repo>/private-vulnerability-reporting
+```
+
+PUT/DELETE return an empty body on success — verify with the GET. Batch across the affected repos like the other per-repo fixes.
+
+**Self-inflicted-failure gotcha:** a *newly created* repo does **not** reliably inherit the org PVR default. If you create a repo as part of these fixes — e.g. a `<org>/.github` repo to hold a default `SECURITY.md` — it can surface as a fresh `private_vulnerability_reporting` failure on the next scan (and bumps the repo count, e.g. 67→68). Enable PVR on any repo you create, then re-check.
+
 ### Branch protection / rulesets
 
 Affects: `commits_are_signed`, `pull_requests_require_reviews`, `release_branches_are_locked`, `release_branches_have_linear_history`.
+
+**Sanity-check moat's target branches before applying.** moat reports a `release_branches` list per repo, but in practice that's whatever it treats as the release branch — usually the default branch, which in some repos is a transient *feature* branch (real examples from one run: `feature/api-llm`, `upgrade/8.0`, `feature/save-form`). Locking or enforcing linear history on a short-lived feature branch is rarely intended. Show the user the actual branch names and confirm the targets — don't blindly feed moat's list into a ruleset.
 
 **Prefer an org-level repository ruleset** over per-repo branch protection rules where the user doesn't already have legacy branch protection in place. Rulesets are newer, cascade across repos in one config, and are easier to maintain.
 
@@ -235,9 +260,9 @@ For batched application across N repos that all need the same rule:
 4. Apply in parallel — fire all `gh api` calls in one tool message.
 5. Report failures grouped at the end (repo + error message).
 
-### Per-repo workflow permissions
+### Per-repo default-token overrides
 
-`repositories_workflow_permissions_are_restricted`. **Re-run moat first** if the org-wide default was just changed — the affected list often shrinks.
+The org-wide PUT (above) covers every repo that *inherits* the org default. A repo that has explicitly **overridden** its default token to `write` still shows under `repositories_actions_workflow_token_is_read_only` after the org change — fix those stragglers per-repo:
 
 ```
 gh api -X PUT /repos/<owner>/<repo>/actions/permissions/workflow \
@@ -246,6 +271,8 @@ gh api -X PUT /repos/<owner>/<repo>/actions/permissions/workflow \
 ```
 
 Batch the same way as branch protection.
+
+**Don't confuse this with `repositories_workflow_permissions_are_restricted`.** That is a *different* check — moat reads each workflow file's `permissions:` block, not the default-token setting, so this endpoint will not clear it. It's file-level → `moat-repo-fixer`. (Verified the hard way: an org-wide token change left a 28-repo `workflow_permissions_are_restricted` count completely unchanged.)
 
 ### Direct collaborators
 
