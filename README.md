@@ -31,6 +31,29 @@ Handles in-repository, file-level fixes from a moat report. Run it inside the re
 
 Before pinning, the skill also flags archived or stale third-party actions (`pushed_at` older than two years) so you do not accidentally pin a SHA from an abandoned action.
 
+It runs in one of two scopes, chosen at the start:
+
+- **This repository** - the default. It auto-detects the current repo and walks its findings.
+- **Every repository in an organisation** - a sweep across all your local checkouts of an org's repos, fixing each in turn, one repo at a time. This is where the bundled repo mapper earns its keep.
+
+#### Mapping repositories to local checkouts
+
+Local project folders rarely match their GitHub repository name - `devcheck` might live in a folder called `claude-bumblebee`, `repo-reporter` in `code_reporter_claude` - and the GitHub remote is not always called `origin` (a repo whose primary is an on-prem GitLab often keeps GitHub as a `github` backup remote). moat reports findings by GitHub repo name, but the repo-fixer needs the *local* path to work in, so the two have to be reconciled. Matching on folder names alone silently misses checkouts; matching on `origin` alone misses the GitLab-primary ones.
+
+The skill ships a small bash resolver, `assets/map_repos_to_local`, to bridge that gap. It scans the immediate sub-directories of a base path, reads *every* git remote of each (never the folder name, and not just `origin`), and prints a CSV of the checkouts belonging to your organisation:
+
+```bash
+assets/map_repos_to_local UoGSoE ~/Documents/code
+```
+
+```
+repo,local_path,current_branch,matched_remote,remote_url
+devcheck,"/Users/you/code/claude-bumblebee",code-review,"origin","git@github.com:UoGSoE/devcheck.git"
+examdb,"/Users/you/code/examdb",master,"github","git@github.com:UoGSoE/examdb.git"
+```
+
+The CSV goes to stdout (pipe it, or redirect with `> repo_map.csv`); a counts line and any duplicate-checkout warnings go to stderr. In the org-wide mode the skill runs this for you, then sorts each flagged repo into "fix it" (a local checkout was found), "clone needed" (no local copy) or "which one?" (the same repo checked out in two places), and checks each checkout's branch and working-tree state before touching anything. You can also run it standalone any time you just want the map.
+
 ### moat-org-fixer
 
 Handles organisation-level and repository-settings fixes via `gh api`, falling back to Chrome DevTools MCP for items that only exist in the web UI. What it does:
@@ -92,8 +115,9 @@ Inside a Claude Code session both skills activate by description; no slash comma
 - "Run moat against my org and walk me through the org-level fixes." triggers `moat-org-fixer`.
 - "Apply the moat findings to this repo, the report is at `./moat_report.json`." triggers `moat-repo-fixer`.
 - "Help me pin my GitHub Actions to commit SHAs and add a dependabot config." triggers `moat-repo-fixer`.
+- "Harden every repo in my UoGSoE org - they live under `~/Documents/code`." triggers `moat-repo-fixer`'s org-wide sweep.
 
-Both skills accept either a user-supplied JSON file (the output of `moat --format json <target>`), or a live `moat` run that the skill kicks off itself. The repo-fixer auto-detects the current repository's owner and name.
+Both skills accept either a user-supplied JSON file (the output of `moat --format json <target>`), or a live `moat` run that the skill kicks off itself. In single-repo mode the repo-fixer auto-detects the current repository's owner and name; in org-wide mode it asks for the organisation and the base path to your projects, then uses the bundled resolver to locate each checkout.
 
 ## Testing it on your own setup
 
