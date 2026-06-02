@@ -25,9 +25,15 @@ Two Claude Code skills, living under `skills/`.
 Handles in-repository, file-level fixes from a moat report. Run it inside the repository you want to harden. It walks through each finding one at a time, previewing the change before applying it. Covered fixes:
 
 - Pinning GitHub Actions in workflow YAML to full commit SHAs, keeping the original tag as an inline comment.
-- Generating a `dependabot.yml` config tailored to the detected ecosystem (composer, npm, github-actions, etc.).
+- Generating a `dependabot.yml` config tailored to the detected ecosystem (composer, npm, github-actions, etc.), including a `cooldown` so Dependabot will not raise PRs for day-zero releases.
 - Adding a `SECURITY.md` from a template, with `git config` values offered as attribution defaults.
 - Adding per-workflow `permissions: contents: read` to restrict the workflow token.
+
+It also offers a round of **proactive npm supply-chain hardening** - prompted by the recent run of npm attacks, and going beyond what moat itself flags. Triggered by detecting a `package.json` or `Dockerfile`, opt-in, and aware of pnpm/yarn:
+
+- An `.npmrc` with a release-age cooldown (`min-release-age`, so newly-published versions are not installed until they have survived a day) and install-script lockdown (`ignore-scripts`, with a per-repo check for native-build packages first).
+- The matching Dependabot `cooldown` above, closing the same window at the automated-PR layer.
+- Switching `npm install` to `npm ci` in Dockerfiles, where a committed lockfile makes the build reproducible.
 
 Before pinning, the skill also flags archived or stale third-party actions (`pushed_at` older than two years) so you do not accidentally pin a SHA from an abandoned action.
 

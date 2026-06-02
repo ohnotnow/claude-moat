@@ -4,3 +4,7 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Don't raise PRs for releases younger than this many days — dodges a
+    # freshly-poisoned version that gets yanked within hours/days. 1–90; tune to taste.
+    cooldown:
+      default-days: 7

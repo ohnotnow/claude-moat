@@ -5,14 +5,22 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    # Don't raise PRs for releases younger than this many days — dodges a
+    # freshly-poisoned version that gets yanked within hours/days. 1–90; tune to taste.
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: npm
     directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
