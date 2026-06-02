@@ -17,6 +17,8 @@ diff -rq skills/<name> .claude/skills/<name>   # expect no output
 
 `.claude/` and `.ant/` are both **gitignored**, so mirror edits never appear in `git status`. It's easy to update the source, see an almost-clean status, and forget the mirror is now stale. Always diff the two after editing a skill.
 
+The reason for this is that you can edit the live skill that is available to Claude Code then when the tweaks are ready you can 'publish' them to the skills/ directory which is where users copy them from into their own Claude Code setups.
+
 ## Layout
 
 ```
