@@ -1,6 +1,6 @@
 ---
 name: moat-repo-fixer
-description: Apply in-repo security hardening fixes that Laravel's `moat` CLI flags for the current repository — pin GitHub Actions to commit SHAs, add a Dependabot config tailored to the repo's ecosystems, drop in a `SECURITY.md`, and restrict per-workflow token permissions. Also applies proactive supply-chain hardening beyond moat's own findings, tailored per ecosystem — npm/Bun install-script and release-age cooldowns, Composer `allow-plugins`, Python (pip/uv) wheels-only installs and hash-pinning, Go checksum and `govulncheck` checks, plus catching stale pinned versions in Dockerfiles and build scripts. Use when the user is inside a repo and wants to action moat findings, or asks to "harden this repo", "fix moat issues here", "apply moat fixes", "harden npm/composer/python/go/bun", or "protect against supply-chain attacks". Settings-level fixes (branch protection, org defaults) are out of scope — those belong to the sibling `moat-org-fixer` skill.
+description: Apply in-repo security hardening fixes that Laravel's `moat` CLI flags for the current repository — pin GitHub Actions to commit SHAs, add a Dependabot config tailored to the repo's ecosystems, drop in a `SECURITY.md`, and restrict per-workflow token permissions. Also applies proactive supply-chain hardening beyond moat's own findings, tailored per ecosystem — npm/Bun install-script and release-age cooldowns, Composer `allow-plugins`, Python (pip/uv) wheels-only installs and hash-pinning, Go checksum and `govulncheck` checks, plus catching stale pinned versions in Dockerfiles and build scripts. Use when the user is inside a repo and wants to action moat findings, or asks to "harden this repo", "fix moat issues here", "apply moat fixes", "harden npm/composer/python/go/bun", or "protect against supply-chain attacks". Can optionally deliver the applied fixes as a GitLab merge request via `glab` when the repo's primary remote is an on-prem/self-managed GitLab (detected from the git remotes, or when the user mentions GitLab) — e.g. "raise a merge request with the moat fixes", "open a gitlab MR", "push these to our gitlab". Settings-level fixes (branch protection, org defaults) are out of scope — those belong to the sibling `moat-org-fixer` skill.
 ---
 
 # moat-repo-fixer
@@ -20,7 +20,7 @@ Everything from *Source the findings* down to *Mode B* is the **per-repo flow** 
 
 1. **User-supplied JSON file** — if the user mentions a moat report (e.g. `moat.json`, `moat_report.json`), load it and filter `checks[].affected[]` for entries matching the current repo.
 
-2. **Live `moat` run** — if `moat` is on `PATH`, detect the current repo's `owner/name` from `git remote get-url origin`, then run:
+2. **Live `moat` run** — if `moat` is on `PATH`, detect the current repo's GitHub `owner/name` (from the GitHub remote — see *Detecting the current repo*; it isn't always `origin`), then run:
    ```
    moat --format json <owner>/<repo>
    ```
@@ -31,13 +31,23 @@ Everything from *Source the findings* down to *Mode B* is the **per-repo flow** 
 
 ## Detecting the current repo
 
-```
-git remote get-url origin
-```
-
-Parse `owner/repo` from both forms:
+moat reads GitHub-side state, so for **finding** purposes you need the repo's GitHub `owner/repo`. Parse it from the GitHub remote (whatever it's *named* — see below), from both forms:
 - `https://github.com/owner/repo.git`
 - `git@github.com:owner/repo.git`
+
+**Enumerate *all* remotes, not just `origin`.** The GitHub remote isn't always `origin`: when an on-prem/self-managed GitLab is the source of truth, `origin` is the GitLab remote and GitHub is a backup named e.g. `github`. The full remote list tells you both the GitHub identity (for moat) *and* how to **deliver** the fixes later (see *Delivery*).
+
+```
+git remote -v
+```
+
+Bucket the remotes by host and decide the **primary remote** — this drives the *Delivery* step and the closing *Next steps*:
+- **`github.com` remote(s) only** → the existing GitHub flow; no MR step.
+- **A non-GitHub (`gitlab.com` / on-prem / custom) remote only** → the GitLab delivery path.
+- **Both** → `AskUserQuestion`: *"which remote is your true primary?"* The answer decides whether the GitLab MR step runs and how *Next steps* is worded.
+- If the user explicitly mentions GitLab, bias to the GitLab path regardless.
+
+(Edge case: a repo with **no** GitHub remote has no moat findings — moat only scans GitHub — but the proactive *Supply-chain hardening* still applies, and can still be delivered as a GitLab MR.)
 
 ## Filter findings
 
@@ -131,7 +141,7 @@ For every `.github/workflows/*.yml`:
 
 ### Fix: `repositories_have_security_policy`
 
-**First, check for an org-wide default — before writing anything.** GitHub serves a default `SECURITY.md` to *every* repo in an org from a special `<owner>/.github` repository (it appears in each repo's Security tab automatically). Many developers — and moat itself — don't know this exists, so the real risk here is **drift**: adding a redundant per-repo file that overrides a perfectly good org default. `<owner>` comes from `git remote get-url origin`; check the canonical locations:
+**First, check for an org-wide default — before writing anything.** GitHub serves a default `SECURITY.md` to *every* repo in an org from a special `<owner>/.github` repository (it appears in each repo's Security tab automatically). Many developers — and moat itself — don't know this exists, so the real risk here is **drift**: adding a redundant per-repo file that overrides a perfectly good org default. `<owner>` is the GitHub owner (from the GitHub remote — see *Detecting the current repo*; not necessarily `origin`); check the canonical locations:
 
 ```
 for p in SECURITY.md .github/SECURITY.md docs/SECURITY.md; do
@@ -233,6 +243,81 @@ moat does **not** flag anything in this section. It's proactive hardening, promp
 
 All the usual guardrails apply: preview → confirm → apply, one change at a time, never a git mutation. Each guide carries its own sensible-default-plus-dial and previews before anything lands.
 
+## Delivery (optional): open a GitLab merge request
+
+Normally the user commits and pushes the applied fixes themselves (you never run git). When the repo's **primary remote** (from *Detecting the current repo*) is a GitLab/custom host — or the user asks to "raise an MR" / "open a gitlab MR" — you can *additionally* open a GitLab **merge request** via `glab`, on a `fix-moat-issues` branch so any tagged reviewer knows what it's about.
+
+This step is **opt-in** and runs **after** the file fixes are applied and confirmed. In Mode B, ask **once** for the whole sweep (see Mode B), then apply per repo.
+
+**The git boundary still holds.** Branch / commit / push are git *writes* — they stay the user's job (and are hook-blocked here). The only thing you run is `glab mr create`, which is a GitLab **API call** — the same category as the `gh api` mutations `moat-org-fixer` runs after a y/n confirm. Offer the same two modes:
+
+- **Apply mode** — you run `glab mr create` after the user has pushed, on their y/n confirmation.
+- **Hand-off mode** — you print the exact command and the user runs it.
+
+**Never** pass `glab mr create --push`, and never run `git branch` / `commit` / `push` / `checkout` — pushing is the user's job (step 3).
+
+### 1. glab auth pre-flight
+
+Mirror the `gh auth` gate in `moat-org-fixer`. `glab` must be authenticated against the repo's GitLab **host** (a self-managed instance, not `gitlab.com`):
+
+```
+glab auth status
+```
+
+The repo's GitLab host (from the remote URL) must appear as authenticated. If it doesn't, **halt the delivery step** (but keep the file fixes — auth only gates the MR) and tell the user:
+
+> `glab` isn't authenticated against `<host>` (your self-managed GitLab). Run:
+> ```
+> glab auth login --hostname <host>
+> ```
+> then re-run the delivery step. (`glab` reads `GITLAB_HOST`/`GL_HOST` or the git remote to pick the host; for a self-managed server it must show in `glab auth status`.)
+
+### 2. Sync pre-flight — is the default branch current with GitLab?
+
+The developer may not have pulled recently. Check **read-only** — no `git fetch` (that's a write the hook blocks); `git ls-remote` only reads, so it passes:
+
+```
+git rev-parse <default-branch>
+git ls-remote <gitlab-remote> refs/heads/<default-branch> | cut -f1
+```
+
+`<gitlab-remote>` is the remote name for the GitLab host (often `origin`); `<default-branch>` is usually `master` or `main`. If the two SHAs **match**, it's current — proceed. If they **differ**, stop and ask the user to pull first (you don't run git):
+
+> Your local `<default-branch>` (`<localsha>`) differs from GitLab (`<remotesha>`). Pull first so the MR branches from current `<default-branch>`, then re-run the delivery step.
+
+### 3. Branch, commit, push — the user's job
+
+You can't run git writes, so hand the user the exact commands, using the `fix-moat-issues` convention:
+
+```
+git checkout -b fix-moat-issues
+git add -A                                        # or just the files we changed
+git commit -m "Apply moat security hardening fixes"
+git push -u <gitlab-remote> fix-moat-issues
+```
+
+Wait for the user to confirm they've pushed — `glab mr create` needs the branch on the server.
+
+### 4. Open the merge request
+
+From **inside the repo** (so `glab` infers the project from the remote — no `-R` needed), once the branch is pushed:
+
+```
+glab mr create \
+  --source-branch fix-moat-issues \
+  --target-branch <default-branch> \
+  --fill
+```
+
+- `--fill` takes the title/description from the commit(s); add `--title` / `--description` if the user wants something more specific (e.g. listing the moat findings actioned).
+- `--target-branch` is the repo's default branch — confirm `master` vs `main`.
+- **Never** add `--push`; pushing was step 3.
+- In **apply mode**, show the exact command and confirm (y/n) before running it; in **hand-off mode**, print it for the user.
+
+`glab` prints the MR URL on success — surface it. On failure (auth, branch not pushed, host unreachable), show the error and stop; don't retry blindly.
+
+**Verified against `glab 1.37.0`** — the flags above are long-standing, so they hold on newer versions too. A couple of self-managed host-resolution details weren't exercised live (the instance needed a VPN at design time): if `glab` can't resolve the host from the remote, set `GITLAB_HOST=<host>` for the command, or lean on `glab auth login --hostname`.
+
 ## Mode B: every repo in an org
 
 This sweeps every *local checkout* of an org's repos and applies the per-repo flow to each. It exists because local directory names — and even remote names — drift from the GitHub repo name (a repo's GitHub remote might be `origin`, or `github` when the primary is an on-prem GitLab and GitHub is a backup), so checkouts can't be found by folder name alone.
@@ -259,6 +344,7 @@ It prints CSV `repo,local_path,current_branch,matched_remote,remote_url` to stdo
 - **Check the working tree first.** Show the repo's `current_branch` and `git status --porcelain`. If it's on a non-default branch or has uncommitted changes, **surface that and ask** whether to (a) fix here anyway, (b) skip this repo, or (c) stop the sweep. Never edit a dirty or feature-branch checkout silently.
 - Run the **per-repo flow above** for that repo, scoping the findings to that repo's entries (you already have them from step 3 — don't re-run moat per repo). The `SECURITY.md` org-default pre-check still applies — and in an org sweep there's very likely an org default, so expect to recommend skipping the per-repo file.
 - The proactive **supply-chain hardening** section is part of the per-repo flow too, but it's opt-in and non-moat. In an org sweep, ask **once** whether to apply it to all qualifying repos (those with a `composer.json` / `package.json` / `go.mod` / `Dockerfile` etc.), then apply consistently per ecosystem — don't re-prompt for every repo.
+- The optional **GitLab MR delivery** (see *Delivery*) is part of the per-repo flow too. If the repos' primary remote is a GitLab/custom host (or the user asked for MRs), ask **once** whether to open a `fix-moat-issues` MR per repo, then do it consistently — the auth and sync pre-flights run per repo, and `glab` infers each project from its checkout's remote (no `-R` needed). Branch/commit/push stay the user's job per repo; you only run `glab mr create`.
 - Honour every guardrail: one fix at a time, preview → confirm → apply, never a git mutation.
 
 **6. Closing summary (org sweep).** On top of the per-repo summaries, give an org-level roll-up:
@@ -267,11 +353,13 @@ It prints CSV `repo,local_path,current_branch,matched_remote,remote_url` to stdo
 - **Clone needed** — flagged repos with no local checkout.
 - **Ambiguous** — repos with multiple checkouts, and which path you used.
 - **Settings-level (for `moat-org-fixer`)** — the org/settings findings you deliberately left alone.
-- **Commit/push is the user's job** — an org sweep leaves uncommitted changes across many working trees. Remind them clearly; you never run git.
+- **Merge requests opened** — repo → MR URL, where GitLab delivery was used.
+- **Commit/push is the user's job** — an org sweep leaves uncommitted changes across many working trees. Remind them clearly; you never run git. (With GitLab delivery, the user still branches/commits/pushes per repo; you only opened the MRs.)
 
 ## Guardrails
 
 - Never run git mutations (`add`, `commit`, `push`, `checkout`, `reset`, `restore`, etc.).
+- The GitLab *Delivery* step isn't an exception to that: `glab mr create` is a GitLab **API call**, not a git write, so it's allowed (after a y/n confirm, like `moat-org-fixer`'s `gh api` calls). The branch/commit/push around it stay the user's job, and **never** use `glab mr create --push`.
 - Never bulk-apply across fix categories. One category at a time, one file at a time across categories.
 - In **Mode B** (org sweep), also work one *repo* at a time — finish or skip a repo before moving to the next; never fan out edits across repos.
 - **Within a single file**, batch multiple changes of the same kind into one preview and apply in one pass. Don't make the user confirm 11 nearly-identical line edits in one workflow.
@@ -288,6 +376,6 @@ Print a structured summary with **all** of the following sections — don't skip
 2. **Skipped / deferred** — anything you didn't do and why (e.g. "action X is archived, recommended replacing before pinning").
 3. **Out-of-scope findings (for `moat-org-fixer`)** — explicitly list every moat finding for this repo whose fix is a setting rather than a file. The user needs to see the *remaining* work, not just what was done. For each: the finding's `label` and the matching repo entry from `affected[]`.
 4. **Next steps**:
-   - The user needs to commit and push these changes themselves (you don't do git).
+   - The user needs to commit and push these changes themselves (you don't do git). **Tailor this to the primary remote** (from *Detecting the current repo*): a GitHub-primary repo gets the usual push to GitHub; a GitLab-primary repo gets the *Delivery* step instead — branch `fix-moat-issues`, push to GitLab, then the `glab mr create` MR (with its URL if you opened it) — not a "push to GitHub" instruction.
    - The org-level default-token fix in `moat-org-fixer` cascades to all repos and clears `repositories_actions_workflow_token_is_read_only` in one go — recommend it as a complementary safety net. But it does **not** clear `repositories_workflow_permissions_are_restricted` (the per-workflow `permissions:` block we fixed here): the two are different findings, so don't suggest deferring the file fix in favour of the org setting.
 5. **Re-verify (optional)** — offer to re-run `moat --format json <owner>/<repo>` after the user has pushed. Be honest about the caveat: file-level checks (`workflow_actions_are_pinned`, `workflow_permissions_are_restricted`, `have_security_policy`, `have_dependabot_config`) should flip locally after push; anything that reads GitHub-side state (branch protection, org policy) won't change until the matching settings are also updated. The proactive supply-chain hardening (per-ecosystem cooldowns, install-script lockdowns, locked installs, audit tooling, and the stale-pin checks) won't appear in moat output at all — moat doesn't check for any of these, so don't expect any count to drop; the protection is real, just invisible to moat.
