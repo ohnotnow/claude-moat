@@ -29,11 +29,15 @@ Handles in-repository, file-level fixes from a moat report. Run it inside the re
 - Adding a `SECURITY.md` from a template, with `git config` values offered as attribution defaults.
 - Adding per-workflow `permissions: contents: read` to restrict the workflow token.
 
-It also offers a round of **proactive npm supply-chain hardening** - prompted by the recent run of npm attacks, and going beyond what moat itself flags. Triggered by detecting a `package.json` or `Dockerfile`, opt-in, and aware of pnpm/yarn:
+It also offers a round of **proactive supply-chain hardening** - prompted by the recent run of attacks across package ecosystems, and going beyond what moat itself flags. It is opt-in and detection-driven: the skill only offers what matches the files actually in the repository, with the per-ecosystem detail kept in reference files (`assets/hardening/`) it loads on demand. The ecosystems are deliberately not treated as copies of one another, because their threat models genuinely differ:
 
-- An `.npmrc` with a release-age cooldown (`min-release-age`, so newly-published versions are not installed until they have survived a day) and install-script lockdown (`ignore-scripts`, with a per-repo check for native-build packages first).
-- The matching Dependabot `cooldown` above, closing the same window at the automated-PR layer.
-- Switching `npm install` to `npm ci` in Dockerfiles, where a committed lockfile makes the build reproducible.
+- **npm** - an `.npmrc` release-age cooldown (`min-release-age`) and install-script lockdown (`ignore-scripts`, checking for native-build packages first), plus switching `npm install` to `npm ci` in Dockerfiles.
+- **Composer** - the real lever is `allow-plugins`, since a dependency's own scripts do not auto-run but its plugins do; `composer install` is already reproducible, and there is no native cooldown yet to lean on.
+- **Python (pip + uv)** - wheels-only installs to avoid arbitrary `setup.py` execution, hash-pinning, frozen installs, and the release-age cooldowns both tools now have (`uv`'s `exclude-newer`, pip's `--uploaded-prior-to`).
+- **Go** - deliberately light, and honest about why: Go runs no install scripts and its checksum database blocks tampering, so most of the npm playbook simply has no equivalent. Confirm the on-by-default protections, add `govulncheck`.
+- **Bun** - already safe by default (its `trustedDependencies` allowlist is the inverse of `ignore-scripts`), with a native cooldown in `bunfig.toml`; the job is to review and tune, not add.
+
+Alongside these, it checks any `Dockerfile`, `build.sh` or `Makefile` for **stale pinned versions** - an old `FROM node:14` or `ARG COMPOSER_VERSION=2.6.3` quietly rebuilding the same unpatched base every time. It resolves the current version live rather than baking one into the skill (which would only go stale itself), flags the gap, and treats a major-version jump as a deliberate decision rather than a one-click bump. The matching Dependabot `cooldown` - and its `docker` ecosystem, which keeps base images current - closes the same windows at the automated-PR layer.
 
 Before pinning, the skill also flags archived or stale third-party actions (`pushed_at` older than two years) so you do not accidentally pin a SHA from an abandoned action.
 

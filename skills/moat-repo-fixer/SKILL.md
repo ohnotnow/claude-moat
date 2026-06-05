@@ -1,6 +1,6 @@
 ---
 name: moat-repo-fixer
-description: Apply in-repo security hardening fixes that Laravel's `moat` CLI flags for the current repository — pin GitHub Actions to commit SHAs, add a Dependabot config tailored to the repo's ecosystems, drop in a `SECURITY.md`, and restrict per-workflow token permissions. Also applies proactive npm supply-chain hardening beyond moat's own findings — an `.npmrc` release-age cooldown and install-script lockdown, a matching Dependabot cooldown, and `npm ci` in Dockerfiles. Use when the user is inside a repo and wants to action moat findings, or asks to "harden this repo", "fix moat issues here", "apply moat fixes", "harden npm", or "protect against npm supply-chain attacks". Settings-level fixes (branch protection, org defaults) are out of scope — those belong to the sibling `moat-org-fixer` skill.
+description: Apply in-repo security hardening fixes that Laravel's `moat` CLI flags for the current repository — pin GitHub Actions to commit SHAs, add a Dependabot config tailored to the repo's ecosystems, drop in a `SECURITY.md`, and restrict per-workflow token permissions. Also applies proactive supply-chain hardening beyond moat's own findings, tailored per ecosystem — npm/Bun install-script and release-age cooldowns, Composer `allow-plugins`, Python (pip/uv) wheels-only installs and hash-pinning, Go checksum and `govulncheck` checks, plus catching stale pinned versions in Dockerfiles and build scripts. Use when the user is inside a repo and wants to action moat findings, or asks to "harden this repo", "fix moat issues here", "apply moat fixes", "harden npm/composer/python/go/bun", or "protect against supply-chain attacks". Settings-level fixes (branch protection, org defaults) are out of scope — those belong to the sibling `moat-org-fixer` skill.
 ---
 
 # moat-repo-fixer
@@ -113,14 +113,14 @@ For every `.github/workflows/*.yml`:
    - `package.json` → `npm`
    - `requirements.txt` / `pyproject.toml` → `pip`
    - `go.mod` → `gomod`
-   - `Dockerfile` → `docker`
+   - `Dockerfile` → `docker` — also raises base-image update PRs, the ongoing twin of the one-off `pinned-versions.md` check (see *Supply-chain hardening*)
    - `.github/workflows/*.yml` → `github-actions` (almost always present, include unconditionally if `.github/workflows` exists)
 2. Pick the closest starting template from `assets/dependabot/`:
    - `laravel.yml` — composer + npm + github-actions (full Laravel app)
    - `php-package.yml` — composer + github-actions (PHP library)
    - `base.yml` — github-actions only
 3. Add/remove ecosystems to match what you actually detected.
-4. **Include a `cooldown` per ecosystem.** This is the automated-PR twin of the `.npmrc` release-age cooldown (see *npm supply-chain hardening* below) — it stops Dependabot raising PRs for day-zero releases. The bundled templates already carry one:
+4. **Include a `cooldown` per ecosystem.** This is the automated-PR twin of the per-ecosystem release-age cooldown (see *Supply-chain hardening* below) — it stops Dependabot raising PRs for day-zero releases. The bundled templates already carry one:
    ```yaml
        cooldown:
          default-days: 7
@@ -204,55 +204,34 @@ Preview each workflow's changes (one preview per file, batching all the permissi
 
 `moat` evolves. If the filtered findings include an `id` not handled above, **do not silently skip** — show the user moat's `label`, `description`, `why_enable`, and `how_to_fix` URL, and ask whether they want help with it. If the fix is a file change, work through it with the same preview-then-confirm pattern.
 
-## npm supply-chain hardening (proactive — not a moat finding)
+## Supply-chain hardening (proactive — not a moat finding)
 
-moat does **not** currently flag any of the things in this section. They're proactive hardening, prompted by the run of npm supply-chain attacks (the Sept 2025 `chalk`/`debug` compromise, the Shai-Hulud worm, the 2026 `axios` incident). Because moat didn't ask for them, they're **opt-in**: only offer them when the repo actually has the relevant files, and only proceed if the user says yes. Re-running moat afterwards will **not** show these as resolved — they were never findings (see *Re-verify* in the closing summary).
+moat does **not** flag anything in this section. It's proactive hardening, prompted by the run of supply-chain attacks across package ecosystems (the Sept 2025 `chalk`/`debug` compromise, the Shai-Hulud worm, the 2026 `axios` incident). Because moat didn't ask for it, it's **opt-in**: only offer it when the repo actually has the relevant files, and only proceed once the user says yes. Re-running moat afterwards will **not** show any of this as resolved — it was never a finding (see *Re-verify* in the closing summary).
 
-**When to offer — detect the files first:**
-- `package.json` present → offer the `.npmrc` hardening (the Dependabot `cooldown` is handled in the dependabot fix above).
-- `Dockerfile` / `Dockerfile.*` present and running `npm install` → offer the `npm ci` switch.
-- Neither present → skip this section silently.
+**These ecosystems are not five copies of the npm pattern.** Each maps the same axes through different mechanisms, and different things are already safe by default. The per-ecosystem detail lives in a self-contained guide under `assets/hardening/` — load only the one(s) that match the repo, and follow it. Orientation map (verified mid-2026 — the tools move fast, so re-check current docs before asserting a version or flag):
 
-**Package-manager check.** This section is written for **npm** (`.npmrc`). If you find `pnpm-lock.yaml` / `pnpm-workspace.yaml` or `yarn.lock` instead, the equivalents differ — pnpm uses `minimumReleaseAge` in **minutes** (default 1440 in pnpm 11) in `pnpm-workspace.yaml`; yarn has its own mechanism. Don't write an npm `.npmrc` into a pnpm/yarn project — tell the user the equivalent and stop.
+| Axis | npm | Composer | pip | uv | Go | Bun |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Release-age cooldown** | `.npmrc` `min-release-age` (npm ≥ 11.10.0) | none native yet → Dependabot only | `--uploaded-prior-to` (pip ≥ 26.1) | `exclude-newer` (date or rolling age) | none native → Dependabot only | `minimumReleaseAge` in `bunfig.toml` (v1.3, seconds) |
+| **Install-script lockdown** | `ignore-scripts` (opt-in) | dep scripts don't auto-run; `allow-plugins` deny-by-default (2.2+) | wheels-only `--only-binary :all:` | wheels-only `--only-binary :all:` | N/A — no install scripts (structural) | `trustedDependencies` allowlist (on by default) |
+| **Locked install (the `npm ci` axis)** | `npm ci` | `composer install` (already is) | `--require-hashes` + pinned reqs | `uv sync --frozen` | `-mod=readonly` (default since 1.16) / vendor | `bun install --frozen-lockfile` |
+| **Audit** | `npm audit` | `composer audit` + 2.10 malware policy | `pip-audit` | `uv audit` (preview) | `govulncheck` (reachability) | Security Scanner API (v1.3) |
+| **Dependabot cooldown** | yes | yes | yes | yes (one known edge bug) | `default-days` only | yes (no security updates; no `bun.lockb`) |
 
-All the usual guardrails apply: preview → confirm → apply, one change at a time, never a git mutation.
+**Detect, then load the matching guide(s).** A repo can trip several rows — a Laravel app has both `composer.json` and `package.json`. Offer each ecosystem in turn, one at a time.
 
-### Proactive fix: `.npmrc` release-age + install-script lockdown
+| Detected in the repo | Ecosystem | Guide to read |
+| --- | --- | --- |
+| `composer.json` | Composer | `assets/hardening/composer.md` |
+| `pyproject.toml` / `requirements.txt` / `uv.lock` | Python (pip + uv) | `assets/hardening/python.md` |
+| `go.mod` | Go | `assets/hardening/go.md` |
+| `bun.lock` / `bun.lockb` / `bunfig.toml` | Bun | `assets/hardening/bun.md` |
+| `package.json` + an npm/pnpm/yarn lock (no Bun signal) | npm (or pnpm/yarn) | `assets/hardening/npm.md` |
+| `Dockerfile` / `build.sh` / `Makefile` | cross-cutting | `assets/hardening/pinned-versions.md` |
 
-Two defensive settings:
+**Package-manager guard.** `package.json` alone doesn't tell you the tool — disambiguate on the lockfile (`bun.lock`/`bun.lockb` → Bun; `pnpm-lock.yaml` → pnpm; `yarn.lock` → yarn; `package-lock.json` → npm). Load that ecosystem's guide; never write an npm `.npmrc` into a Bun/pnpm/yarn project.
 
-```ini
-# Don't install any version published less than a day ago. A poisoned release
-# is usually detected and yanked within hours (chalk/debug ~2.5h, Shai-Hulud
-# ~12h), so even a short cooldown filters most compromises. Value is in days.
-min-release-age=1
-# Don't run dependency lifecycle scripts — the postinstall hook most worms fire from.
-ignore-scripts=true
-```
-
-**Write or merge — never clobber.** If `.npmrc` exists, `Read` it and add only the missing keys (preview as a `diff -u`); if it doesn't, create it (preview as a fenced block). Never overwrite registry/auth lines the user already has.
-
-**`min-release-age` caveats — say these out loud before applying:**
-- It needs **npm ≥ 11.10.0**. Older npm silently ignores the key, so a committed `.npmrc` gives false comfort. Recommend pinning the Node/npm version in CI so the setting actually bites.
-- The value is in **days**. `1` is the floor that catches fast-yanked compromises; 3–7 buys more margin at the cost of lag on legitimate updates. It's a dial — mention it.
-
-**`ignore-scripts` is the blunt one — detect, then caution.** Before setting it, scan `package.json` (deps *and* devDeps) for packages that legitimately build on install, and tailor the warning:
-- *Genuinely fragile* — `node-gyp`-based native modules, `node-sass`, anything with a known compile-on-install step → warn the install/build **will** break without an allowlist.
-- *Degraded-but-works* — `esbuild` (and tools that bundle it: `vite`, `tsup`) still get their platform binary via `optionalDependencies`, so builds run, but the `.bin` shim stays on the slower JS path. Tailwind v4's `oxide` engine ships prebuilt platform packages and is unaffected. (`ignore-scripts` combined with `--no-optional` *does* break esbuild — never recommend that pairing.)
-- After applying, recommend a smoke-test — `npm ci && npm run build` (or the repo's build script) — to confirm nothing downstream broke.
-- For surgical control instead of all-or-nothing, point at `@lavamoat/allow-scripts`: it lets named packages keep their install scripts while blocking the rest.
-
-### Proactive fix: `npm install` → `npm ci` in the Dockerfile
-
-`npm ci` installs the **exact** locked versions, wipes `node_modules` first, and errors if `package.json` and the lockfile disagree — reproducible builds, no surprise re-resolution at image-build time.
-
-**Preconditions — check before suggesting the edit:**
-1. A **`package-lock.json` must be committed** (and copied into the build stage — a `COPY package*.json` glob already includes it). `npm ci` fails outright without a lockfile. If there's none, *don't* just rewrite the line — recommend generating and committing one first (`npm install` once locally), then switching.
-2. Only convert a **bare** `npm install` (optionally with `--production` / `--omit=dev`). Leave `npm install <pkg>` and `npm install -g <tool>` alone — `npm ci` takes no package arguments and will error.
-
-Rewrite e.g. `RUN npm install && npm run build` → `RUN npm ci && npm run build`. Preview the Dockerfile change as a `diff -u`, confirm, apply.
-
-**Don't copy the `.npmrc` cooldown into the Docker stage.** It's tempting to make the Docker build honour `min-release-age` too, but it's wrong: `min-release-age` gates version *resolution*, and `npm ci` installs already-locked versions — a cooldown there would *error* if a locked version were younger than the gate, breaking your own CI build of already-vetted deps. The cooldown belongs at the resolution layer (developers' `.npmrc` + Dependabot); `npm ci` simply reproduces the already-aged lockfile. Three layers, no conflict.
+All the usual guardrails apply: preview → confirm → apply, one change at a time, never a git mutation. Each guide carries its own sensible-default-plus-dial and previews before anything lands.
 
 ## Mode B: every repo in an org
 
@@ -279,7 +258,7 @@ It prints CSV `repo,local_path,current_branch,matched_remote,remote_url` to stdo
 - `cd` into its `local_path`.
 - **Check the working tree first.** Show the repo's `current_branch` and `git status --porcelain`. If it's on a non-default branch or has uncommitted changes, **surface that and ask** whether to (a) fix here anyway, (b) skip this repo, or (c) stop the sweep. Never edit a dirty or feature-branch checkout silently.
 - Run the **per-repo flow above** for that repo, scoping the findings to that repo's entries (you already have them from step 3 — don't re-run moat per repo). The `SECURITY.md` org-default pre-check still applies — and in an org sweep there's very likely an org default, so expect to recommend skipping the per-repo file.
-- The proactive **npm supply-chain hardening** section is part of the per-repo flow too, but it's opt-in and non-moat. In an org sweep, ask **once** whether to apply it to all qualifying repos (those with a `package.json` / `Dockerfile`), then apply consistently — don't re-prompt for every repo.
+- The proactive **supply-chain hardening** section is part of the per-repo flow too, but it's opt-in and non-moat. In an org sweep, ask **once** whether to apply it to all qualifying repos (those with a `composer.json` / `package.json` / `go.mod` / `Dockerfile` etc.), then apply consistently per ecosystem — don't re-prompt for every repo.
 - Honour every guardrail: one fix at a time, preview → confirm → apply, never a git mutation.
 
 **6. Closing summary (org sweep).** On top of the per-repo summaries, give an org-level roll-up:
@@ -299,7 +278,7 @@ It prints CSV `repo,local_path,current_branch,matched_remote,remote_url` to stdo
 - Always show a preview before writing — `diff -u` against a temp file for modifications, a fenced code block for new files.
 - Already-correct items get skipped silently — don't rewrite a workflow file just to touch it.
 - If you can't resolve something (e.g. a private action you don't have `gh api` access to), ask the user — don't guess a SHA.
-- The **npm supply-chain hardening** section is proactive, not a moat finding — only offer it when the relevant files (`package.json` / `Dockerfile`) exist, and only act on the user's say-so. Never write an npm `.npmrc` into a pnpm/yarn project.
+- The **supply-chain hardening** section is proactive, not a moat finding — only offer it when the relevant ecosystem files (`composer.json`, `package.json`, `pyproject.toml`, `go.mod`, `bun.lock`, `Dockerfile`, …) exist, and only act on the user's say-so. Load the matching per-ecosystem guide; never write an npm `.npmrc` into a Bun/pnpm/yarn project.
 
 ## After all fixes
 
@@ -311,4 +290,4 @@ Print a structured summary with **all** of the following sections — don't skip
 4. **Next steps**:
    - The user needs to commit and push these changes themselves (you don't do git).
    - The org-level default-token fix in `moat-org-fixer` cascades to all repos and clears `repositories_actions_workflow_token_is_read_only` in one go — recommend it as a complementary safety net. But it does **not** clear `repositories_workflow_permissions_are_restricted` (the per-workflow `permissions:` block we fixed here): the two are different findings, so don't suggest deferring the file fix in favour of the org setting.
-5. **Re-verify (optional)** — offer to re-run `moat --format json <owner>/<repo>` after the user has pushed. Be honest about the caveat: file-level checks (`workflow_actions_are_pinned`, `workflow_permissions_are_restricted`, `have_security_policy`, `have_dependabot_config`) should flip locally after push; anything that reads GitHub-side state (branch protection, org policy) won't change until the matching settings are also updated. The proactive npm hardening (`.npmrc`, Dockerfile `npm ci`, Dependabot `cooldown`) won't appear in moat output at all — moat doesn't check for these, so don't expect any count to drop; the protection is real, just invisible to moat.
+5. **Re-verify (optional)** — offer to re-run `moat --format json <owner>/<repo>` after the user has pushed. Be honest about the caveat: file-level checks (`workflow_actions_are_pinned`, `workflow_permissions_are_restricted`, `have_security_policy`, `have_dependabot_config`) should flip locally after push; anything that reads GitHub-side state (branch protection, org policy) won't change until the matching settings are also updated. The proactive supply-chain hardening (per-ecosystem cooldowns, install-script lockdowns, locked installs, audit tooling, and the stale-pin checks) won't appear in moat output at all — moat doesn't check for any of these, so don't expect any count to drop; the protection is real, just invisible to moat.
