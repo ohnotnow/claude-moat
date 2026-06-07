@@ -29,6 +29,8 @@ ignore-scripts=true
 - It needs **npm ≥ 11.10.0**. Older npm silently ignores the key, so a committed `.npmrc` gives false comfort. Recommend pinning the Node/npm version in CI so the setting actually bites.
 - The value is in **days**. `1` is the floor that catches fast-yanked compromises; 3–7 buys more margin at the cost of lag on legitimate updates. It's a dial — mention it.
 
+**Cooldown ≠ remediation — say this so the `.npmrc` isn't mistaken for a fix.** `min-release-age` and `ignore-scripts` defend against *future* poisoned releases; they do **nothing** for a version already in the tree that's *already* known-vulnerable (a stale `axios`, say). Clearing those is `npm audit` + an actual upgrade, not a cooldown. On a GitLab-only repo there's no Dependabot to raise that upgrade either (see the Dependabot note below), so flag the already-old deps explicitly rather than letting the new `.npmrc` imply they're handled.
+
 **`ignore-scripts` is the blunt one — detect, then caution.** Before setting it, scan `package.json` (deps *and* devDeps) for packages that legitimately build on install, and tailor the warning:
 
 - *Genuinely fragile* — `node-gyp`-based native modules, `node-sass`, anything with a known compile-on-install step → warn the install/build **will** break without an allowlist.
@@ -40,6 +42,8 @@ After applying, recommend a smoke-test — `npm ci && npm run build` (or the rep
 ## Fix: `npm install` → `npm ci` in the Dockerfile
 
 `npm ci` installs the **exact** locked versions, wipes `node_modules` first, and errors if `package.json` and the lockfile disagree — reproducible builds, no surprise re-resolution at image-build time.
+
+**Find the install line with the `Grep`/`Read` tools, not `bash grep`.** A `bash grep 'npm install' Dockerfile` trips the user's edit-checker hook (and the dedicated file-search tools are the house default anyway) — use `Grep` for the `RUN npm install` pattern, `Read` to confirm the surrounding context, then `Edit`.
 
 **Preconditions — check before suggesting the edit:**
 
@@ -53,6 +57,8 @@ Rewrite e.g. `RUN npm install && npm run build` → `RUN npm ci && npm run build
 ## The matching Dependabot cooldown
 
 The automated-PR twin of `min-release-age` lives in `.github/dependabot.yml` (handled by the `repositories_have_dependabot_config` fix in `SKILL.md`). With `interval: weekly`, use `default-days: 7` rather than `1` — a 1-day cooldown rarely changes anything at a weekly cadence. Cooldown applies to version updates only, not security updates.
+
+**GitHub-only:** Dependabot doesn't run on a GitLab-only repo, so this automated twin is inert there — see `SKILL.md` › *Supply-chain hardening* for the GitLab story (Dependency Scanning / Renovate, or periodic review against the dated pins).
 
 ---
 *Sources / last verified ~mid-2026: npm `.npmrc` config docs (`min-release-age`, `ignore-scripts`); `@lavamoat/allow-scripts`; esbuild `optionalDependencies` behaviour. Re-check `min-release-age`'s minimum npm version before asserting it.*

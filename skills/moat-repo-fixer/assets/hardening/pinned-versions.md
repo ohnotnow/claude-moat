@@ -20,6 +20,8 @@ Resolve live, e.g. (verify the command/endpoint still works before relying on it
 
 - Base images: `FROM node:14`, `FROM python:3.9-slim`, `FROM golang:1.20`, `FROM composer:2.6` → resolve current, flag the gap.
 - Build ARGs: `ARG NODE_VERSION=18`, `ARG COMPOSER_VERSION=2.6.3`, `ARG GO_VERSION=1.20` → same.
+- **Skip internal multi-stage stage refs.** A `FROM <earlier-stage>` (`FROM dev AS prod`, `FROM builder`) just references a stage defined earlier in the *same* Dockerfile — there's no upstream image or tag to pin, so leave it alone. Only the *external* bases (a registry image like `node:14`) get pinned. A multi-stage file commonly has a handful of these internal refs mixed in with one or two real bases; pinning a stage name is a mistake.
+- **Variable / build-arg base tags need pinning where the value is set, not inline.** `FROM uogsoe/soe-php-apache:${PHP_VERSION}` has no literal tag to rewrite — the tag arrives from an `ARG PHP_VERSION` (often *supplied by CI*, e.g. a workflow passing `PHP_VERSION=8.0` as a build-arg). You can't pin the `FROM` line itself; trace where `PHP_VERSION` is defined (`ARG` default in the Dockerfile, or the `--build-arg` in the workflow / compose file) and flag *that* as the thing to pin/digest. Surface the indirection to the user rather than trying to rewrite the `FROM`.
 
 **Compose / Swarm stack files & CI `image:` tags (structured — safe to act on):** `image:`/`services:` entries live in more than `Dockerfile`s. Scan:
 
@@ -34,6 +36,15 @@ Pin the *third-party* ones to a digest. **Skip the project's own images** — th
 - `*_VERSION=` assignments
 - `go install x@v1.2.3`, `pip install foo==1.2.3`, `npm i -g tool@1.2.3`
 - `curl …/download/vX.Y.Z/…`-style version-pinned fetches
+
+## Moving and untagged tags are their own smell — the image-world `@latest`
+
+Separate from a *stale* pin (a concrete-but-old `node:14`), watch for tags that aren't pinned to a version at all — the image equivalent of the `@latest` action smell:
+
+- **Moving tags:** `docker:stable`, `node:latest`, `python:edge`, `:lts` — these are republished in place, so the same line pulls a different image over time. Non-reproducible, and a poisoned/regressed upstream lands silently. (`docker:stable` is itself *deprecated* on top of being a moving tag.)
+- **Untagged images:** `image: mailhog/mailhog` with no tag at all resolves to `:latest` implicitly — same problem, easier to miss because there's no tag to even look at.
+
+Flag these as a smell and resolve to a **concrete version + digest** (same comment convention as below). It's the direct parallel of recommending a tagged release over `@latest` for actions: pin to a real version first, then to its digest.
 
 ## Majors get a health warning — not a one-click
 
@@ -61,7 +72,7 @@ If a pin already carries a comment like the above — a named version, a date, a
 
 ## Don't let it drift again: Dependabot `docker` ecosystem
 
-The one-off catch-up here pairs with the **ongoing** twin: Dependabot's `docker` ecosystem raises base-image update PRs automatically. The Dependabot fix in `SKILL.md` already adds `docker` when a `Dockerfile` is present — point the user at it so the Dockerfile stays current without manual sweeps. **Caveat for stack files:** Dependabot's `docker` ecosystem watches `Dockerfile`s and standard compose files, but *not* non-standard Swarm stack filenames like `prod-stack.yml` / `qa-stack.yml` without explicit `directory`/filename config — so digest pins in those files have **no automated freshness story** unless you add one (or accept they're reviewed by hand; the dated comment above is what makes that review possible). *(Confirm Dependabot's current base-image / digest / compose-filename behaviour before describing specifics.)*
+The one-off catch-up here pairs with the **ongoing** twin: Dependabot's `docker` ecosystem raises base-image update PRs automatically. The Dependabot fix in `SKILL.md` already adds `docker` when a `Dockerfile` is present — point the user at it so the Dockerfile stays current without manual sweeps. **Caveat for stack files:** Dependabot's `docker` ecosystem watches `Dockerfile`s and standard compose files, but *not* non-standard Swarm stack filenames like `prod-stack.yml` / `qa-stack.yml` without explicit `directory`/filename config — so digest pins in those files have **no automated freshness story** unless you add one (or accept they're reviewed by hand; the dated comment above is what makes that review possible). **And it's GitHub-only:** on a GitLab-only repo Dependabot doesn't run at all, so *every* digest pin here falls back to the dated-comment + manual-review story (or a GitLab equivalent — Dependency Scanning / Renovate); see `SKILL.md` › *Supply-chain hardening*. *(Confirm Dependabot's current base-image / digest / compose-filename behaviour before describing specifics.)*
 
 ---
 *Sources / last verified ~mid-2026: GitHub Dependabot docker ecosystem docs; go.dev/dl JSON feed; Composer GitHub releases. The whole point of this guide is that versions are resolved live — it deliberately contains none.*

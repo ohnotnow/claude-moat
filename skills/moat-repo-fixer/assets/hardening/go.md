@@ -47,5 +47,7 @@ No native Go equivalent. **Dependabot `gomod` supports `cooldown` with `default-
     default-days: 7      # semver-*-days are ignored for gomod
 ```
 
+**GitHub-only:** Dependabot doesn't run on a GitLab-only repo — and since Go has *no* native cooldown, that leaves a GitLab-only Go project with no release-age cooldown at all. See `SKILL.md` › *Supply-chain hardening* for the GitLab story (Dependency Scanning / Renovate, or periodic review). `govulncheck` and the on-by-default checksum protections above are host-agnostic and still your best line of defence there.
+
 ---
 *Sources / last verified ~mid-2026: go.dev/blog/supply-chain; go.dev/blog/go116-module-changes; go.dev/doc/go1.13; go.dev/doc/toolchain; pkg.go.dev govulncheck; GitHub Dependabot options reference. `GONOSUMCHECK` is not a current variable — don't recommend it.*

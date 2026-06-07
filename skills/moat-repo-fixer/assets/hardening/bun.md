@@ -52,5 +52,7 @@ scanner = "@socketsecurity/bun-security-scanner"
 
 Supports the `bun` ecosystem with `cooldown` — but **no security updates** for bun, and **no `bun.lockb`** (migrate to `bun.lock` first, Bun ≥ v1.1.39).
 
+**GitHub-only:** Dependabot doesn't run on a GitLab-only repo (see `SKILL.md` › *Supply-chain hardening*). As with Python, Bun's *cooldown itself* is native (`minimumReleaseAge` in `bunfig.toml`) and host-agnostic — you only lose the automated *bump-PR* twin on GitLab. There, lean on the native cooldown + the Security Scanner API above, or a GitLab equivalent (Dependency Scanning / Renovate) for automated bumps.
+
 ---
 *Sources / last verified ~mid-2026: bun.com docs (lockfile, trusted deps, bunfig, npmrc, security-scanner-api); Bun v1.3 announcement (minimumReleaseAge, scanner); GitHub Dependabot supported-ecosystems & options. Flagged: the `.npmrc ignore-scripts` precedence caveat and the `bunx` / `bun update` cooldown gaps come from third-party reports / open issues — confirm current behaviour before asserting.*

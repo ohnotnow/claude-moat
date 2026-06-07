@@ -33,6 +33,7 @@ Proactive, opt-in hardening for **Composer** projects. moat does not flag any of
   RUN composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader
   ```
   `--no-dev` drops dev tooling; `--no-interaction` makes the `allow-plugins` gate fail closed. (Base-image / Composer-version pins in that Dockerfile → `pinned-versions.md`.)
+  - **Inspect the Dockerfile's `composer` line with the `Grep`/`Read` tools, not `bash grep`** — a `bash grep` of project files trips the user's edit-checker hook, and the file-search tools are the house default anyway.
 - `--no-scripts` is available as defence-in-depth but is **secondary** (dep scripts don't auto-run). In a Laravel build it can break package discovery / autoload-dump — only add it if the build genuinely needs no root scripts, or run `php artisan package:discover` explicitly afterwards.
 
 ## Fix: auditing in CI
@@ -44,6 +45,8 @@ Proactive, opt-in hardening for **Composer** projects. moat does not flag any of
 **Composer has no native release-age cooldown yet** — `minimum-release-age` is reserved in the policy schema but blocked on Packagist making release metadata immutable first (composer/composer #12877). Watch this space; don't tell the user Composer has it today.
 
 Until then, the cooldown comes from **Dependabot** on the `composer` ecosystem (`.github/dependabot.yml`, handled in `SKILL.md`) — supports `default-days` and the per-semver split. Version updates only, not security updates.
+
+**GitHub-only:** Dependabot doesn't run on a GitLab-only repo, so this is inert there — see `SKILL.md` › *Supply-chain hardening* for the GitLab story (Dependency Scanning / Renovate, or periodic review against the dated pins). Without it, a Composer project on GitLab has *no* automated cooldown at all (Composer still has none natively).
 
 ## TLS / HTTPS posture — verify, don't change
 

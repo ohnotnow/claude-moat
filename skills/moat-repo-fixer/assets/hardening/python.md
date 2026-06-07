@@ -43,6 +43,7 @@ Refuses to build any sdist; installs only wheels. **What breaks:** any dependenc
   Requires the index to expose PEP 700 upload-time metadata (PyPI does; private indexes may not). `exclude-newer-package = { … }` for per-package exceptions.
 - **pip — `--uploaded-prior-to` (pip ≥ 26.1):** a date or `PnD` duration (e.g. `P7D`); only considers versions that have sat that long. *(Confirm the exact flag name against `pip --help` on the pinned version — taken from the 26.1 release notes.)*
 - **Dependabot:** supports both `pip` and `uv` ecosystems. **Use `package-ecosystem: "uv"` for `uv.lock` projects.** Keep its `cooldown` in step with `exclude-newer` so Dependabot doesn't open PRs uv then refuses to lock. *(Known edge bug: the uv-ecosystem cooldown has fired prematurely for a 1-day-old dep — dependabot-core #14544.)*
+  - **GitHub-only:** Dependabot doesn't run on a GitLab-only repo (see `SKILL.md` › *Supply-chain hardening*). Python is the least-affected ecosystem here, though — the *cooldown itself* is native (uv's `exclude-newer`, pip's `--uploaded-prior-to`) and works regardless of host; it's only the automated *bump-PR* twin you lose on GitLab. There, lean on the native cooldowns + `pip-audit`, or a GitLab equivalent (Dependency Scanning / Renovate) for the automated bumps.
 
 ## Fix: index hardening (dependency-confusion)
 

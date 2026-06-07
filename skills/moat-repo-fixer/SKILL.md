@@ -18,6 +18,11 @@ Everything from *Source the findings* down to *Mode B* is the **per-repo flow** 
 
 ## Source the findings (preference order)
 
+**First, bucket the repo's remotes** (jump down to *Detecting the current repo*, then come back) — that decides whether moat even applies:
+
+- **No `github.com` remote at all** → moat has nothing to scan; it only reads GitHub-side state. **Skip this entire findings flow** and go straight to *Supply-chain hardening* (proactive, host-agnostic) and, if the user wants it, *Delivery*. Don't run `moat` against a repo with no GitHub identity — it has no target. **If such a repo still carries a `.github/workflows/` directory**, don't silently ignore it: those workflows can't run without a GitHub home, so they're most likely vestigial. Surface them and offer to (a) remove them as cruft, or (b) — *only if the user push-mirrors to GitHub* — pin them proactively (the pinning/permissions fixes below, run by hand rather than off a moat finding). Ask which; don't assume either way.
+- **A `github.com` remote exists** → continue with the preference order below.
+
 1. **User-supplied JSON file** — if the user mentions a moat report (e.g. `moat.json`, `moat_report.json`), load it and filter `checks[].affected[]` for entries matching the current repo.
 
 2. **Live `moat` run** — if `moat` is on `PATH`, detect the current repo's GitHub `owner/name` (from the GitHub remote — see *Detecting the current repo*; it isn't always `origin`), then run:
@@ -47,7 +52,7 @@ Bucket the remotes by host and decide the **primary remote** — this drives the
 - **Both** → `AskUserQuestion`: *"which remote is your true primary?"* The answer decides whether the GitLab MR step runs and how *Next steps* is worded.
 - If the user explicitly mentions GitLab, bias to the GitLab path regardless.
 
-(Edge case: a repo with **no** GitHub remote has no moat findings — moat only scans GitHub — but the proactive *Supply-chain hardening* still applies, and can still be delivered as a GitLab MR.)
+(This is the no-GitHub case the top of *Source the findings* routes on: no moat findings — moat only scans GitHub — but the proactive *Supply-chain hardening* still applies and can still be delivered as a GitLab MR, and a dormant `.github/workflows/` gets surfaced rather than silently ignored.)
 
 ## Filter findings
 
@@ -135,6 +140,8 @@ For every `.github/workflows/*.yml`:
    **If you suggest a replacement, verify it first** with the same `archived`/`pushed_at` check — don't recommend something from training memory that may itself have gone stale since.
 
    **Prefer a replacement the repo already trusts.** Before reaching for an unfamiliar action, check whether another workflow in the *same repo* already uses a maintained action for the same job — recommend consolidating onto that one rather than introducing a new dependency. (Real example: a `main.yml` pinning the archived `marvinpinto/action-automatic-releases@latest` while a sibling `cli-release.yml` already uses the maintained `softprops/action-gh-release` — the fix is to switch to what's already in the repo.) Still verify it with the `archived`/`pushed_at` check.
+
+   **This check is branch-scoped — "same repo" really means "same branch".** The sibling workflow you'd consolidate onto must exist *on the branch moat scanned / the one you're editing* (see *Reconcile the scanned branch*). The `cli-release.yml`/`softprops` example only helps if that file is on the branch you're fixing — when the finding sits on an accidental default like `feature/save-form` and the maintained alternative only lives on `master`, the swap isn't available on the branch that's actually red. Confirm the candidate exists on the right branch before recommending it.
 5. Rewrite as `uses: owner/repo@<full_sha> # <original_ref>` so a human reader can still see the version.
 6. Preview the changes for the file (batch all refs in that file into one preview), confirm, apply.
 7. If a ref is `@main`, `@master`, a branch name, **or a moving tag like `@latest` / `@stable`**, surface that as a smell — these are republished in place, so they're as mutable as a branch. Recommend pinning to a specific tagged release first, then to its SHA. (`@latest` is common on release actions and especially worth catching.)
@@ -186,6 +193,8 @@ Belt-and-braces, this shows what GitHub *actually serves* to the current repo �
 gh api /repos/<owner>/<repo>/community/profile --jq '.files.security_policy.html_url'
 ```
 
+**Trust the direct `<owner>/.github` contents check over this one.** `community/profile` is the *less* reliable of the two — it has returned `null` for `security_policy.html_url` on a repo that demonstrably had an org default (the endpoint can lag, or miss a non-standard default branch / private repo). So a non-null profile URL is useful *confirmation*, but a `null` here does **not** mean there's no org default — defer to the direct contents check above before concluding the repo is uncovered.
+
 **If an org-wide default exists**, surface it instead of silently writing a file:
 
 > This repo has no `SECURITY.md` of its own — **but** your org already provides a default via `<owner>/.github` (`<url>`), which already covers this repo's Security tab. Adding a repo-specific file would override that and start exactly the drift we want to avoid. (Current moat already counts the inherited default as a pass, so you're most likely seeing this on the manual fallback path, or on an older moat.) Want to (a) leave it to the org default — recommended — or (b) add a repo-specific `SECURITY.md` because this repo genuinely needs different contact/policy details?
@@ -221,6 +230,8 @@ permissions:
 
 If a workflow legitimately needs more, keep the grant as narrow as possible and add a one-line comment explaining why.
 
+**Before defaulting a workflow to `contents: read`, read what its jobs actually do — don't set the floor reflexively.** A *monolithic single-job* workflow that builds **and** cuts a release (one job running tests, then `softprops/action-gh-release` or `marvinpinto/action-automatic-releases`) genuinely needs `contents: write`; dropping it to `read` will break the release. The elevated-permissions table below tells you what such a job needs — but only if you've read the steps first. Splitting that one job into separate build and release jobs *would* let you scope `write` to just the release job (true least-privilege), but that's a refactor of someone's pipeline — flag it as an option, don't silently restructure it.
+
 **Common actions that need elevated permissions** (use this as a starting point — verify against the action's current docs if unsure, and prefer the narrowest grant):
 
 | Action | Minimum permissions |
@@ -250,6 +261,8 @@ Preview each workflow's changes (one preview per file, batching all the permissi
 ## Supply-chain hardening (proactive — not a moat finding)
 
 moat does **not** flag anything in this section. It's proactive hardening, prompted by the run of supply-chain attacks across package ecosystems (the Sept 2025 `chalk`/`debug` compromise, the Shai-Hulud worm, the 2026 `axios` incident). Because moat didn't ask for it, it's **opt-in**: only offer it when the repo actually has the relevant files, and only proceed once the user says yes. Re-running moat afterwards will **not** show any of this as resolved — it was never a finding (see *Re-verify* in the closing summary).
+
+**Dependabot is GitHub-only — mind the host.** Several guides below pair their one-off fix with an *ongoing* Dependabot twin (the npm/composer/gomod/docker cooldowns, automated base-image bump PRs). Those only run on **GitHub**. On a **GitLab-only** repo (no `github.com` remote) a `.github/dependabot.yml` does nothing, so that automated-freshness half is **inert** — the one-off pins you apply get no automatic upkeep, which is exactly the "pinned and forgotten → reproducibly vulnerable" trap `pinned-versions.md` opens with. Say so plainly rather than implying Dependabot has it covered, and point at the GitLab equivalents instead: **GitLab Dependency Scanning** (vulnerability detection) and **self-hosted Renovate** (the closest thing to Dependabot's version-bump MRs on GitLab). If neither is in play, the honest fallback is the dated pin-comments plus periodic manual review. (This is why the per-guide Dependabot notes carry a "GitHub-only" pointer back here.)
 
 **These ecosystems are not five copies of the npm pattern.** Each maps the same axes through different mechanisms, and different things are already safe by default. The per-ecosystem detail lives in a self-contained guide under `assets/hardening/` — load only the one(s) that match the repo, and follow it. Orientation map (verified mid-2026 — the tools move fast, so re-check current docs before asserting a version or flag):
 
@@ -288,6 +301,12 @@ This step is **opt-in** and runs **after** the file fixes are applied and confir
 - **Hand-off mode** — you print the exact command and the user runs it.
 
 **Never** pass `glab mr create --push`, and never run `git branch` / `commit` / `push` / `checkout` — pushing is the user's job (step 3).
+
+> **Which default branch? The GitLab remote's own — never the GitHub default.** On a both-hosts repo the GitHub default branch (what moat scanned — and it can be an *accident* like `feature/save-form`, see *Reconcile the scanned branch*) is often **not** the GitLab default, and may not even exist on GitLab. Branching or targeting an MR against it would point at a non-existent branch. Resolve the GitLab default **independently**, once, and reuse it for both the sync pre-flight (step 2) and the MR target (step 4):
+> ```
+> git ls-remote --symref <gitlab-remote> HEAD   # prints: ref: refs/heads/<default>\tHEAD
+> ```
+> Read the branch name off the `ref: refs/heads/<name>` line — that `<name>` is the `<default-branch>` used below. Don't carry the GitHub default into delivery.
 
 ### 1. glab auth pre-flight
 
@@ -343,7 +362,7 @@ glab mr create \
 ```
 
 - `--fill` takes the title/description from the commit(s); add `--title` / `--description` if the user wants something more specific (e.g. listing the moat findings actioned).
-- `--target-branch` is the repo's default branch — confirm `master` vs `main`.
+- `--target-branch` is the **GitLab remote's** default branch (resolved via `git ls-remote --symref` above — *never* the GitHub default, which may differ or not exist on GitLab); confirm `master` vs `main`.
 - **Never** add `--push`; pushing was step 3.
 - In **apply mode**, show the exact command and confirm (y/n) before running it; in **hand-off mode**, print it for the user.
 
