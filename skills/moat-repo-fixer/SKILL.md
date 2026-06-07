@@ -1,6 +1,6 @@
 ---
 name: moat-repo-fixer
-description: Apply in-repo security hardening fixes that Laravel's `moat` CLI flags for the current repository — pin GitHub Actions to commit SHAs, add a Dependabot config tailored to the repo's ecosystems, drop in a `SECURITY.md`, and restrict per-workflow token permissions. Also applies proactive supply-chain hardening beyond moat's own findings, tailored per ecosystem — npm/Bun install-script and release-age cooldowns, Composer `allow-plugins`, Python (pip/uv) wheels-only installs and hash-pinning, Go checksum and `govulncheck` checks, plus catching stale pinned versions in Dockerfiles and build scripts. Use when the user is inside a repo and wants to action moat findings, or asks to "harden this repo", "fix moat issues here", "apply moat fixes", "harden npm/composer/python/go/bun", or "protect against supply-chain attacks". Can optionally deliver the applied fixes as a GitLab merge request via `glab` when the repo's primary remote is an on-prem/self-managed GitLab (detected from the git remotes, or when the user mentions GitLab) — e.g. "raise a merge request with the moat fixes", "open a gitlab MR", "push these to our gitlab". Settings-level fixes (branch protection, org defaults) are out of scope — those belong to the sibling `moat-org-fixer` skill.
+description: Apply in-repo security hardening fixes that Laravel's `moat` CLI flags for the current repository — pin GitHub Actions to commit SHAs, add a Dependabot config tailored to the repo's ecosystems, drop in a `SECURITY.md`, and restrict per-workflow token permissions. Also applies proactive supply-chain hardening beyond moat's own findings, tailored per ecosystem — npm/Bun install-script and release-age cooldowns, Composer `allow-plugins`, Python (pip/uv) wheels-only installs and hash-pinning, Go checksum and `govulncheck` checks, plus pinning Docker image tags to digests and catching stale pinned versions across Dockerfiles, compose/Swarm stack files and CI config. Use when the user is inside a repo and wants to action moat findings, or asks to "harden this repo", "fix moat issues here", "apply moat fixes", "harden npm/composer/python/go/bun", or "protect against supply-chain attacks". Can optionally deliver the applied fixes as a GitLab merge request via `glab` when the repo's primary remote is an on-prem/self-managed GitLab (detected from the git remotes, or when the user mentions GitLab) — e.g. "raise a merge request with the moat fixes", "open a gitlab MR", "push these to our gitlab". Settings-level fixes (branch protection, org defaults) are out of scope — those belong to the sibling `moat-org-fixer` skill.
 ---
 
 # moat-repo-fixer
@@ -35,7 +35,7 @@ moat reads GitHub-side state, so for **finding** purposes you need the repo's Gi
 - `https://github.com/owner/repo.git`
 - `git@github.com:owner/repo.git`
 
-**Enumerate *all* remotes, not just `origin`.** The GitHub remote isn't always `origin`: when an on-prem/self-managed GitLab is the source of truth, `origin` is the GitLab remote and GitHub is a backup named e.g. `github`. The full remote list tells you both the GitHub identity (for moat) *and* how to **deliver** the fixes later (see *Delivery*).
+**Enumerate *all* remotes, not just `origin`, and key off the *host*, not the remote's name.** Naming conventions vary and even invert: a repo backed by an on-prem/self-managed GitLab might have `origin` = GitLab and GitHub a backup named `github` — or the exact opposite (`origin` = GitHub, with the GitLab remote named `gitlab`). Don't assume from the name; bucket by host. The full remote list tells you both the GitHub identity (for moat) *and* how to **deliver** the fixes later (see *Delivery*).
 
 ```
 git remote -v
@@ -60,6 +60,25 @@ jq --arg repo "<repo>" '.checks[] | select(.status == "fail" and ((.affected // 
 Show the user the filtered list using moat's own `label` and `summary` — keeps the *reasons* current as moat evolves rather than baking them into this skill.
 
 If no findings apply to this repo, say so and exit.
+
+## Reconcile the scanned branch with your checkout
+
+**moat scans a branch — and it may not be the one you have checked out.** moat evaluates GitHub-side state for the repo's **default branch**, which can differ from your local checkout (e.g. a repo created with `gh repo create` while on a feature branch keeps *that* branch as the GitHub default). Each finding carries the branch it came from in `affected[].branch`. If you fix the wrong branch's files, your edits won't match what moat flagged, the two branches may even hold *different* workflow files, and a re-run stays red no matter how good your fixes are.
+
+Before editing anything, reconcile three things:
+
+```
+gh api repos/<owner>/<repo> --jq .default_branch   # the branch moat scanned
+git branch --show-current                           # what you have checked out
+```
+…plus the `affected[].branch` on the findings themselves.
+
+- **All three agree** → proceed normally.
+- **They differ** → **stop and surface it. Don't silently edit the local branch.** Explain the mismatch and recommend one of:
+  - reset the GitHub **default branch** to the branch you actually ship from (a repo-settings change — often the real fix when the default was set by accident), then re-run moat; or
+  - check out the branch moat scanned, so your edits land where the findings are.
+
+  **Never switch branches yourself** — `git checkout` is a git mutation and the user owns it. Hand them the choice and the commands, and wait for them to resolve it before walking the fixes.
 
 ## Walk through each fix — one at a time
 
@@ -91,7 +110,9 @@ If no findings apply to this repo, say so and exit.
 
 - Always clean up temp files whether the change was applied, rejected, or errored.
 
-### Fix: `repositories_workflow_actions_are_pinned`
+### Fix: `repositories_workflow_actions_are_sha_pinned`
+
+(moat renamed this from `repositories_workflow_actions_are_pinned` — match on the current id; older reports may carry the old name.)
 
 For every `.github/workflows/*.yml`:
 
@@ -112,11 +133,17 @@ For every `.github/workflows/*.yml`:
    Flag (don't auto-skip) any action where `archived: true` or `pushed_at` is more than 2 years ago. These are real supply-chain smells: an abandoned action is one compromise away from being a problem. Surface them to the user with a recommendation to find a maintained alternative before pinning.
 
    **If you suggest a replacement, verify it first** with the same `archived`/`pushed_at` check — don't recommend something from training memory that may itself have gone stale since.
+
+   **Prefer a replacement the repo already trusts.** Before reaching for an unfamiliar action, check whether another workflow in the *same repo* already uses a maintained action for the same job — recommend consolidating onto that one rather than introducing a new dependency. (Real example: a `main.yml` pinning the archived `marvinpinto/action-automatic-releases@latest` while a sibling `cli-release.yml` already uses the maintained `softprops/action-gh-release` — the fix is to switch to what's already in the repo.) Still verify it with the `archived`/`pushed_at` check.
 5. Rewrite as `uses: owner/repo@<full_sha> # <original_ref>` so a human reader can still see the version.
 6. Preview the changes for the file (batch all refs in that file into one preview), confirm, apply.
-7. If a ref is `@main`, `@master`, or a branch name, surface that as a smell — recommend the user pin to a tagged release first, then to its SHA.
+7. If a ref is `@main`, `@master`, a branch name, **or a moving tag like `@latest` / `@stable`**, surface that as a smell — these are republished in place, so they're as mutable as a branch. Recommend pinning to a specific tagged release first, then to its SHA. (`@latest` is common on release actions and especially worth catching.)
+
+> **Settings-level partner (for `moat-org-fixer`):** pinning the refs by hand is only half of it. moat also reports `repositories_enforce_workflow_actions_sha_pinning` — the repo/org **setting** that *requires* pinned SHAs, so an unpinned ref can't be reintroduced later. That's a settings fix (org-fixer's job), not a file edit, but name it in your out-of-scope summary so the user sees the pair.
 
 ### Fix: `repositories_have_dependabot_config`
+
+**What moat actually checks here is narrow:** it passes as long as the `github-actions` ecosystem is tracked in `.github/dependabot.yml`. So if a config already lists `github-actions`, this finding is **already green** — and *adding* the other ecosystems below (npm, composer, docker, gomod, …) is **proactive completeness**, not closing a moat finding. Like the supply-chain section, those extra entries won't move any moat count. Worth doing, but be honest with the user about which is closing a finding and which isn't.
 
 1. Detect ecosystems present in the repo:
    - `composer.json` → `composer`
@@ -125,6 +152,8 @@ For every `.github/workflows/*.yml`:
    - `go.mod` → `gomod`
    - `Dockerfile` → `docker` — also raises base-image update PRs, the ongoing twin of the one-off `pinned-versions.md` check (see *Supply-chain hardening*)
    - `.github/workflows/*.yml` → `github-actions` (almost always present, include unconditionally if `.github/workflows` exists)
+
+   **Look in subdirectories, not just the repo root.** A monorepo buries ecosystems one level down — a Go CLI at `cli/go.mod` inside a Laravel app, a frontend at `web/package.json`. Detect marker files wherever they live (e.g. `find . -name go.mod -not -path '*/vendor/*' -not -path '*/node_modules/*'`) and set each Dependabot entry's `directory:` to the **directory of the marker** (`/cli`, not `/`). Root-only detection silently misses these — and they're often the components that ship binaries, so they matter most.
 2. Pick the closest starting template from `assets/dependabot/`:
    - `laravel.yml` — composer + npm + github-actions (full Laravel app)
    - `php-package.yml` — composer + github-actions (PHP library)
@@ -141,7 +170,9 @@ For every `.github/workflows/*.yml`:
 
 ### Fix: `repositories_have_security_policy`
 
-**First, check for an org-wide default — before writing anything.** GitHub serves a default `SECURITY.md` to *every* repo in an org from a special `<owner>/.github` repository (it appears in each repo's Security tab automatically). Many developers — and moat itself — don't know this exists, so the real risk here is **drift**: adding a redundant per-repo file that overrides a perfectly good org default. `<owner>` is the GitHub owner (from the GitHub remote — see *Detecting the current repo*; not necessarily `origin`); check the canonical locations:
+**Current moat usually *passes* this when an org-wide default exists — so you may not see it as a finding at all.** GitHub serves a default `SECURITY.md` to *every* repo in an org from a special `<owner>/.github` repository (it appears in each repo's Security tab automatically), and moat now reads that inherited default and counts it as satisfied (fixed via [laravel/moat#18](https://github.com/laravel/moat/issues/18), ~June 2026 — *older* moat versions false-positived here, so a pre-fix moat may still flag it).
+
+So the real risk is **drift**: adding a redundant per-repo file that overrides a perfectly good org default. **Check for an org-wide default before writing anything** — it matters most on the *manual fallback path* (moat not installed, so you can't lean on its now-correct pass) and as plain DRY hygiene. `<owner>` is the GitHub owner (from the GitHub remote — see *Detecting the current repo*; not necessarily `origin`); check the canonical locations:
 
 ```
 for p in SECURITY.md .github/SECURITY.md docs/SECURITY.md; do
@@ -157,7 +188,7 @@ gh api /repos/<owner>/<repo>/community/profile --jq '.files.security_policy.html
 
 **If an org-wide default exists**, surface it instead of silently writing a file:
 
-> This repo has no `SECURITY.md` of its own — **but** your org already provides a default via `<owner>/.github` (`<url>`), which already covers this repo's Security tab. Adding a repo-specific file would override that and start exactly the drift we want to avoid. moat flags this anyway because it only reads *this repo's* own contents (a known false-positive when an org default exists). Want to (a) leave it to the org default — recommended — or (b) add a repo-specific `SECURITY.md` because this repo genuinely needs different contact/policy details?
+> This repo has no `SECURITY.md` of its own — **but** your org already provides a default via `<owner>/.github` (`<url>`), which already covers this repo's Security tab. Adding a repo-specific file would override that and start exactly the drift we want to avoid. (Current moat already counts the inherited default as a pass, so you're most likely seeing this on the manual fallback path, or on an older moat.) Want to (a) leave it to the org default — recommended — or (b) add a repo-specific `SECURITY.md` because this repo genuinely needs different contact/policy details?
 
 Only write a file if the user picks (b). Otherwise record it under "Skipped / deferred" with the reason ("covered by org-wide default at `<url>`") and move on.
 
@@ -208,6 +239,8 @@ If you see an action not in the table, read its `action.yml` (`gh api repos/<own
 
 **Multi-job workflows:** set `permissions: contents: read` at the workflow root, and grant elevated permissions at the *job* level only on the jobs that need them. Don't grant the whole workflow `contents: write` just because one job cuts a release — the principle of least privilege applies per-job, not per-workflow.
 
+**An *existing* `permissions:` block can still be too broad — tighten it even if moat is quiet.** moat may treat a workflow as satisfied simply because *a* block is present, so a workflow granting `contents: write` at the root of a multi-job pipeline can pass while still over-privileged (e.g. a build+release pair where only the release job needs write). If you spot one, tighten it: root `contents: read`, elevate on the job that needs it. This is proactive — it may not move a moat count — but it's the same least-privilege principle, so do it while you're in the file.
+
 Preview each workflow's changes (one preview per file, batching all the permissions blocks in that file — and combining with any pinning changes for the same file, per the batching rule in the guardrails), confirm, apply.
 
 ## Other possible findings
@@ -228,7 +261,7 @@ moat does **not** flag anything in this section. It's proactive hardening, promp
 | **Audit** | `npm audit` | `composer audit` + 2.10 malware policy | `pip-audit` | `uv audit` (preview) | `govulncheck` (reachability) | Security Scanner API (v1.3) |
 | **Dependabot cooldown** | yes | yes | yes | yes (one known edge bug) | `default-days` only | yes (no security updates; no `bun.lockb`) |
 
-**Detect, then load the matching guide(s).** A repo can trip several rows — a Laravel app has both `composer.json` and `package.json`. Offer each ecosystem in turn, one at a time.
+**Detect, then load the matching guide(s).** A repo can trip several rows — a Laravel app has both `composer.json` and `package.json`. Offer each ecosystem in turn, one at a time. **And look beyond the repo root:** a marker file can sit in a subdirectory (a Go CLI at `cli/go.mod`, a frontend at `web/package.json`), so a root-only check misses it — scan subdirectories (skipping `vendor/` and `node_modules/`) and run the matching guide against the directory the marker actually lives in.
 
 | Detected in the repo | Ecosystem | Guide to read |
 | --- | --- | --- |
@@ -237,7 +270,7 @@ moat does **not** flag anything in this section. It's proactive hardening, promp
 | `go.mod` | Go | `assets/hardening/go.md` |
 | `bun.lock` / `bun.lockb` / `bunfig.toml` | Bun | `assets/hardening/bun.md` |
 | `package.json` + an npm/pnpm/yarn lock (no Bun signal) | npm (or pnpm/yarn) | `assets/hardening/npm.md` |
-| `Dockerfile` / `build.sh` / `Makefile` | cross-cutting | `assets/hardening/pinned-versions.md` |
+| `Dockerfile` / compose & stack files (`docker-compose.yml`, `*-stack.yml`) / `build.sh` / `Makefile` / workflow `image:`/`services:` (GitHub *and* `.gitlab-ci.yml`) | cross-cutting (image-digest pinning) | `assets/hardening/pinned-versions.md` |
 
 **Package-manager guard.** `package.json` alone doesn't tell you the tool — disambiguate on the lockfile (`bun.lock`/`bun.lockb` → Bun; `pnpm-lock.yaml` → pnpm; `yarn.lock` → yarn; `package-lock.json` → npm). Load that ecosystem's guide; never write an npm `.npmrc` into a Bun/pnpm/yarn project.
 
@@ -281,7 +314,7 @@ git rev-parse <default-branch>
 git ls-remote <gitlab-remote> refs/heads/<default-branch> | cut -f1
 ```
 
-`<gitlab-remote>` is the remote name for the GitLab host (often `origin`); `<default-branch>` is usually `master` or `main`. If the two SHAs **match**, it's current — proceed. If they **differ**, stop and ask the user to pull first (you don't run git):
+`<gitlab-remote>` is the remote name for the GitLab host (whatever it's called — `origin`, `gitlab`, … — keyed by host, not name); `<default-branch>` is usually `master` or `main`. If the two SHAs **match**, it's current — proceed. If they **differ**, stop and ask the user to pull first (you don't run git):
 
 > Your local `<default-branch>` (`<localsha>`) differs from GitLab (`<remotesha>`). Pull first so the MR branches from current `<default-branch>`, then re-run the delivery step.
 
@@ -332,7 +365,7 @@ bash <skill-dir>/assets/map_repos_to_local <org> <base-path>
 ```
 It prints CSV `repo,local_path,current_branch,matched_remote,remote_url` to stdout, plus a counts line and any duplicate-repo warnings to stderr. Capture stdout.
 
-**3. Source the org's findings** (same preference order as Mode A, at org scope): if the user has a recent moat **report**, use it; otherwise offer to run `moat --format json <org>`. Keep only the **file-level** findings this skill owns — `repositories_workflow_actions_are_pinned`, `repositories_workflow_permissions_are_restricted`, `repositories_have_security_policy`, `repositories_have_dependabot_config`. Settings-level findings belong to `moat-org-fixer`: name them in the summary but don't act on them here.
+**3. Source the org's findings** (same preference order as Mode A, at org scope): if the user has a recent moat **report**, use it; otherwise offer to run `moat --format json <org>`. Keep only the **file-level** findings this skill owns — `repositories_workflow_actions_are_sha_pinned`, `repositories_workflow_permissions_are_restricted`, `repositories_have_security_policy`, `repositories_have_dependabot_config` (note the last two often show as **pass**: `have_security_policy` when an org default exists, `have_dependabot_config` when `github-actions` is already tracked). Settings-level findings — including `repositories_enforce_workflow_actions_sha_pinning` — belong to `moat-org-fixer`: name them in the summary but don't act on them here.
 
 **4. Join findings to checkouts.** For each flagged repo, look it up in the map and bucket it:
 - **one local checkout** → queue for fixing
@@ -342,6 +375,7 @@ It prints CSV `repo,local_path,current_branch,matched_remote,remote_url` to stdo
 **5. Fix each queued repo, one at a time.** For each, in turn:
 - `cd` into its `local_path`.
 - **Check the working tree first.** Show the repo's `current_branch` and `git status --porcelain`. If it's on a non-default branch or has uncommitted changes, **surface that and ask** whether to (a) fix here anyway, (b) skip this repo, or (c) stop the sweep. Never edit a dirty or feature-branch checkout silently.
+- **Reconcile against the branch moat scanned** (the *Reconcile the scanned branch* step from the per-repo flow): compare the local `current_branch` to the repo's GitHub default branch and to the finding's `affected[].branch`. If they differ, the local checkout may not match what moat flagged — surface it and resolve before editing, exactly as in Mode A. In a sweep this is easy to miss across many repos, so check it per repo.
 - Run the **per-repo flow above** for that repo, scoping the findings to that repo's entries (you already have them from step 3 — don't re-run moat per repo). The `SECURITY.md` org-default pre-check still applies — and in an org sweep there's very likely an org default, so expect to recommend skipping the per-repo file.
 - The proactive **supply-chain hardening** section is part of the per-repo flow too, but it's opt-in and non-moat. In an org sweep, ask **once** whether to apply it to all qualifying repos (those with a `composer.json` / `package.json` / `go.mod` / `Dockerfile` etc.), then apply consistently per ecosystem — don't re-prompt for every repo.
 - The optional **GitLab MR delivery** (see *Delivery*) is part of the per-repo flow too. If the repos' primary remote is a GitLab/custom host (or the user asked for MRs), ask **once** whether to open a `fix-moat-issues` MR per repo, then do it consistently — the auth and sync pre-flights run per repo, and `glab` infers each project from its checkout's remote (no `-R` needed). Branch/commit/push stay the user's job per repo; you only run `glab mr create`.
@@ -377,5 +411,6 @@ Print a structured summary with **all** of the following sections — don't skip
 3. **Out-of-scope findings (for `moat-org-fixer`)** — explicitly list every moat finding for this repo whose fix is a setting rather than a file. The user needs to see the *remaining* work, not just what was done. For each: the finding's `label` and the matching repo entry from `affected[]`.
 4. **Next steps**:
    - The user needs to commit and push these changes themselves (you don't do git). **Tailor this to the primary remote** (from *Detecting the current repo*): a GitHub-primary repo gets the usual push to GitHub; a GitLab-primary repo gets the *Delivery* step instead — branch `fix-moat-issues`, push to GitLab, then the `glab mr create` MR (with its URL if you opened it) — not a "push to GitHub" instruction.
+   - **If the repo has *both* hosts** (e.g. GitLab primary, GitHub a mirror/backup), remember the fixes we made are to `.github/workflows` — which only take effect *on GitHub*. Say explicitly whether the user also needs to push to GitHub, or whether their GitLab→GitHub mirror carries it across; don't leave them assuming one push covered both.
    - The org-level default-token fix in `moat-org-fixer` cascades to all repos and clears `repositories_actions_workflow_token_is_read_only` in one go — recommend it as a complementary safety net. But it does **not** clear `repositories_workflow_permissions_are_restricted` (the per-workflow `permissions:` block we fixed here): the two are different findings, so don't suggest deferring the file fix in favour of the org setting.
-5. **Re-verify (optional)** — offer to re-run `moat --format json <owner>/<repo>` after the user has pushed. Be honest about the caveat: file-level checks (`workflow_actions_are_pinned`, `workflow_permissions_are_restricted`, `have_security_policy`, `have_dependabot_config`) should flip locally after push; anything that reads GitHub-side state (branch protection, org policy) won't change until the matching settings are also updated. The proactive supply-chain hardening (per-ecosystem cooldowns, install-script lockdowns, locked installs, audit tooling, and the stale-pin checks) won't appear in moat output at all — moat doesn't check for any of these, so don't expect any count to drop; the protection is real, just invisible to moat.
+5. **Re-verify (optional)** — offer to re-run `moat --format json <owner>/<repo>` after the user has pushed. Be honest about the caveats: file-level checks (`workflow_actions_are_sha_pinned`, `workflow_permissions_are_restricted`, `have_security_policy`, `have_dependabot_config`) should flip — but only once the fixes land **on the branch moat scans** (the repo's GitHub default; see *Reconcile the scanned branch* — fixing a different local branch won't move them). Anything that reads GitHub-side state (branch protection, org policy) won't change until the matching settings are also updated. The proactive supply-chain hardening (per-ecosystem cooldowns, install-script lockdowns, locked installs, audit tooling, and the stale-pin checks) won't appear in moat output at all — moat doesn't check for any of these, so don't expect any count to drop; the protection is real, just invisible to moat.
