@@ -14,6 +14,10 @@ Resolve live, e.g. (verify the command/endpoint still works before relying on it
 - Go → `curl -s 'https://go.dev/dl/?mode=json' | jq -r '.[0].version'`
 - Node / Python / `golang` base images → the official release feed / Docker Hub tags (`gh api` / registry); cross-check against the project's own support policy (e.g. Node LTS).
 
+**Fetch lean — pull only the digest into context, not the manifest body.** Resolving an image digest can return a multi-arch manifest *list* (a sizeable JSON blob); reading the whole thing into context is a needless token cost, multiplied across many images and repos. Request just the digest — a registry `HEAD` reading the `Docker-Content-Digest` header, or a `--format` / `--jq` that emits only the `sha256:…` — so the ~71-char digest lands, not the manifest. (Verify the exact incantation still works; don't assert one from memory.)
+
+**Reuse across a sweep — the resolution cache.** When hardening many repos the same images recur, so resolve each once via the optional `~/.cache/moat-repo-fixer/pins.tsv` cache described in `SKILL.md` › *Resolution cache* (48h TTL, write-checked + graceful-degrade, human still confirms the actual digest in the preview). It caches image digests here and action SHAs there.
+
 ## What to scan
 
 **Dockerfile (structured — safe to act on):**
@@ -50,6 +54,7 @@ Flag these as a smell and resolve to a **concrete version + digest** (same comme
 
 - **Patch/minor** (e.g. `node:22.1` → `node:22.7`, `python:3.12.1` → `3.12.7`): low-risk; offer as a normal preview → confirm edit.
 - **Major** (e.g. `node:14` → `node:22`, `php:8.1` → `php:8.4`): potentially breaking. **Show the gap and the risk, recommend a deliberate, tested bump — don't present it as a safe one-click.** If they're far behind, step up to the nearest supported line first.
+- **EOL images mean "upgrade *or* replace" — don't assume an in-place bump.** A base that's past end-of-life (`mysql:5.7`, EOL Oct 2023; `node:14`; `python:3.8`) gets no more security patches, so *pinning it to a digest just freezes the vulnerability* — flag it, don't pin it. But the fix isn't always "bump to a newer tag of the same image": sometimes the right move is to **switch to a different image entirely** (a team migrating `mysql` → `mariadb`, say). When you flag an EOL image, ask *"upgrade in place, or replace/migrate to a different image?"* rather than steering straight at a same-image version bump — and treat either as deliberate, tested work.
 - Prefer pinning base images to a digest (`node:22-bookworm@sha256:…`) for reproducibility *and* letting Dependabot bump it (below). Resolve the digest live; never hand-write one from memory.
 
 ## Pinning to a digest: leave a comment that says what, when, and how to refresh
@@ -69,6 +74,14 @@ This is deliberately richer than the actions convention (`uses: owner/repo@<sha>
 ## A deliberate, documented pin is *not* a smell — don't nag it
 
 If a pin already carries a comment like the above — a named version, a date, a reason — treat it as **intentional**. Surface its rationale; do **not** reflexively recommend a bump. The redis example is pinned *on purpose* (bumping it restarts the session store and logs everyone out), and the comment is your only signal of that intent. Flag genuinely *undocumented* or obviously-rotted pins (a bare `FROM node:14` from years ago); leave documented deliberate ones alone unless the user asks — and if you do raise one, lead with the comment's stated reason, not the version gap.
+
+**If the user asks to *match* a deliberate pin elsewhere, resolve its tag live first — it may have silently diverged.** A common request is "pin redis in dev/qa to the same digest `prod-stack.yml` already uses." Before copying the digest across, resolve the tag live: the pin may be an *older rebuild* of the same tag — same version (`redis:8.2.2`), different digest, because the upstream tag was rebuilt (an OS-layer patch) since prod was pinned. When that's the case, "match prod" and "be current" are no longer the same thing, so surface the three-way choice rather than copying blind:
+
+- **match-old** — copy prod's existing digest for cross-environment consistency (what was literally asked);
+- **current** — pin dev/qa to the freshly-resolved digest (newer, but now *ahead* of prod);
+- **refresh-all** — bring prod up to current too.
+
+And name the side-effect of touching the deliberate pin: refreshing it may carry the very deployment cost that froze it in the first place (refreshing prod redis restarts the session store → logs everyone out — see the dual-motive note above). Leave the call to the user; just make the divergence and its consequence visible.
 
 ## Don't let it drift again: Dependabot `docker` ecosystem
 

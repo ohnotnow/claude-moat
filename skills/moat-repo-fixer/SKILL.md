@@ -117,6 +117,23 @@ git branch --show-current                           # what you have checked out
 
 - Always clean up temp files whether the change was applied, rejected, or errored.
 
+### Resolution cache (optional — for multi-repo sweeps)
+
+Across a dozen repos the same identifiers recur constantly — `actions/checkout@v4`, `docker/build-push-action@v6`, `node:22`. Re-resolving each per repo burns time *and* tokens: every `gh api`/registry result lands in context and is re-billed on each later turn, so overlapping refs are paid for over and over. An optional on-disk cache lets a sweep resolve each unique identifier **once**. It covers both this section's action SHAs/metadata and the image digests in `pinned-versions.md`.
+
+- **Single-repo (Mode A) with no prior cache has nothing to reuse — skip it.** The cache earns its keep from the *second* repo on (a Mode B sweep, or repeated Mode A runs over a day or two).
+- **Location:** `~/.cache/moat-repo-fixer/pins.tsv`. **Test writability first** — `mkdir -p ~/.cache/moat-repo-fixer 2>/dev/null && [ -w ~/.cache/moat-repo-fixer ]`; if it fails, **silently skip caching and resolve live**. The cache is an optimization, never a correctness dependency, and writes outside the project root may be sandbox-blocked.
+- **Format:** one tab-separated entry per line, with a *per-entry* timestamp so the TTL works granularly:
+  ```
+  action-sha     actions/checkout@v4     <40-char-sha>                       2026-06-08T14:03:00Z
+  action-meta    actions/checkout        archived=false;pushed=2026-05-30    2026-06-08T14:03:00Z
+  image-digest   node:22                 sha256:<…>                          2026-06-08T14:03:00Z
+  ```
+- **TTL: 48h (a sweep), not weeks.** Tags move (`@v4`, `node:22` are republished in place) and even concrete tags get rebuilt (the `redis:8.2.2` OS-patch case). A long TTL pins everyone to stale, unpatched digests — the very "pinned-and-forgotten → reproducibly vulnerable" trap this skill warns against. On a hit newer than the TTL, reuse; otherwise re-resolve and rewrite the entry.
+- **If you ever raise the TTL, carve `action-meta` out of the cache.** The archived/`pushed_at` check is a *security signal*, not a freshness nicety — it's the one answer you least want stale (a recently-archived action slipping through). 48h is narrow enough to cache it; weeks are not.
+- **The cache feeds the *preview*, never the apply.** The human still sees the actual SHA/digest in the `diff -u` and confirms, so a stale or wrong cache line can't land silently.
+- **Bonus:** within the TTL every repo pins a recurring ref to the *same* SHA — uniform across the org, and one Dependabot bump moves the whole fleet.
+
 ### Fix: `repositories_workflow_actions_are_sha_pinned`
 
 (moat renamed this from `repositories_workflow_actions_are_pinned` — match on the current id; older reports may carry the old name.)
@@ -128,12 +145,12 @@ For every `.github/workflows/*.yml`:
    - Refs that are already a full 40-char SHA
    - Local refs (`./.github/workflows/foo.yml`)
    - Docker (`docker://...`)
-3. For each remaining ref, resolve to a full SHA:
+3. For each remaining ref, resolve to a full SHA — **check the resolution cache first** (see *Resolution cache* above); only resolve live on a miss or stale entry:
    ```
    gh api repos/<owner>/<repo>/commits/<ref> --jq .sha
    ```
-   **These calls are independent — fire them in parallel** (one tool message with N Bash calls) rather than serialising 12 round-trips.
-4. **Check the action isn't stale or archived.** Same `gh api` call gives you the repo metadata:
+   **The live calls are independent — fire them in parallel** (one tool message with N Bash calls) rather than serialising 12 round-trips. Write each freshly-resolved SHA back to the cache.
+4. **Check the action isn't stale or archived** (cache key `action-meta` — one call per *action repo*, not per ref, so it dedups hard across a sweep). The repo-metadata call:
    ```
    gh api repos/<owner>/<repo> --jq '{archived, pushed_at}'
    ```
@@ -176,6 +193,14 @@ For every `.github/workflows/*.yml`:
    Why `7` here when the `.npmrc` uses `1`? The meaningful value is schedule-dependent: with `interval: weekly`, a 1-day cooldown rarely changes anything (most releases are already older than a day by the weekly run), whereas ~7 days actually dodges a freshly-poisoned release. Different layer, different sensible number — same goal. Cooldown applies to version updates only (not security updates) and accepts 1–90 days; tune `default-days` (and optionally the `semver-major-days` / `-minor-days` / `-patch-days` split) to taste.
 5. Write to `.github/dependabot.yml`. Preview, confirm.
 6. If `.github/dependabot.yml` already exists, diff the proposed against the existing and let the user decide what to merge.
+
+**Check existence robustly, and cross-check GitHub when moat disagrees with you.** Test the path on its own (`test -f .github/dependabot.yml`) rather than folding it into a combined `ls a b c 2>/dev/null || echo none` — a combined `ls` exits non-zero if *any* listed file is missing, so the `|| echo none` fires even when the file is present and you can end up believing it's absent when it isn't. And if moat **passes** `repositories_have_dependabot_config` while you think there's no local file (or vice-versa), don't carry the contradiction: that's a tell your local tree and GitHub's scanned branch have diverged. Cross-check what GitHub actually serves — the same habit the `SECURITY.md` fix uses below:
+
+```
+gh api repos/<owner>/<repo>/contents/.github/dependabot.yml --jq .name
+```
+
+then reconcile (see *Reconcile the scanned branch*) before editing.
 
 ### Fix: `repositories_have_security_policy`
 
@@ -233,6 +258,17 @@ permissions:
 If a workflow legitimately needs more, keep the grant as narrow as possible and add a one-line comment explaining why.
 
 **Before defaulting a workflow to `contents: read`, read what its jobs actually do — don't set the floor reflexively.** A *monolithic single-job* workflow that builds **and** cuts a release (one job running tests, then `softprops/action-gh-release` or `marvinpinto/action-automatic-releases`) genuinely needs `contents: write`; dropping it to `read` will break the release. The elevated-permissions table below tells you what such a job needs — but only if you've read the steps first. Splitting that one job into separate build and release jobs *would* let you scope `write` to just the release job (true least-privilege), but that's a refactor of someone's pipeline — flag it as an option, don't silently restructure it.
+
+**Read `repositories_actions_workflow_token_is_read_only` alongside this, and settle the release-action decision *first*.** Whether the workflow needs `write` at all is *driven* by what happens to the release step, so decide that before the `permissions:` block. Two coupled signals:
+
+- If moat **passes** `repositories_actions_workflow_token_is_read_only`, the default token is already read-only — so a release step in the workflow likely *couldn't write anyway*, a tell that it's broken or unused. (It's a *different* finding from this one — see the note at the top of this section — but it's the cleanest evidence of whether the release step is load-bearing.)
+- The release-step choice is pin / replace / **drop**. Keeping or pinning it still needs `contents: write`; replacing it needs write for the new action too; **dropping** it makes the whole workflow trivially `contents: read`. So settle that choice and the permissions floor falls out of it.
+
+**Short-circuit for a fallback release step.** Walking the full reasoning every time is tedious when the answer is always the same — common where **GitHub Actions is a secondary/fallback CI and the project's real CI/release runs elsewhere** (e.g. a GitLab-primary repo where GitHub Actions is only a backup — you'll have spotted this from the remotes in *Detecting the current repo*). When you see a monolithic build+release job whose **only** write-needing step is the release, offer a *single consolidated question* instead of the multi-turn dance — but keep it a question, and state the consequence inline (dropping a release step is destructive for a project whose GitHub release *is* how it ships):
+
+> This workflow's only step needing `contents: write` is the release step (`<action>`). I can **drop the release step and set the workflow to `contents: read`** in one go — tagged builds still build/push images, they just won't create a GitHub *release* entry any more. Fine if GitHub Actions is a fallback and your real release runs elsewhere; **not** fine if the GitHub release is how you distribute. Options: **(a) drop it → `contents: read`**, (b) keep the release and scope `write` to just that job, (c) keep as-is. Which?
+
+**Lead with (a) only when the fallback signal is present** (a non-GitHub primary remote, or the user has said GitHub Actions is a backup); otherwise present the three options even-handedly and let the user choose. In **Mode B** (org sweep) this is a natural *ask-once*: confirm the policy for the whole sweep — *"for any repo whose only write-needing step is a fallback release step, drop it and go read-only?"* — and apply it consistently rather than re-prompting per repo.
 
 **Common actions that need elevated permissions** (use this as a starting point — verify against the action's current docs if unsure, and prefer the narrowest grant):
 
@@ -432,6 +468,9 @@ Print a structured summary with **all** of the following sections — don't skip
 3. **Out-of-scope findings (for `moat-org-fixer`)** — explicitly list every moat finding for this repo whose fix is a setting rather than a file. The user needs to see the *remaining* work, not just what was done. For each: the finding's `label` and the matching repo entry from `affected[]`.
 4. **Next steps**:
    - The user needs to commit and push these changes themselves (you don't do git). **Tailor this to the primary remote** (from *Detecting the current repo*): a GitHub-primary repo gets the usual push to GitHub; a GitLab-primary repo gets the *Delivery* step instead — branch `fix-moat-issues`, push to GitLab, then the `glab mr create` MR (with its URL if you opened it) — not a "push to GitHub" instruction.
-   - **If the repo has *both* hosts** (e.g. GitLab primary, GitHub a mirror/backup), remember the fixes we made are to `.github/workflows` — which only take effect *on GitHub*. Say explicitly whether the user also needs to push to GitHub, or whether their GitLab→GitHub mirror carries it across; don't leave them assuming one push covered both.
+   - **If the repo has *both* hosts**, be explicit about *which change lands where* — don't leave the user assuming one push covered both:
+     - **`.github/*` (workflows, `dependabot.yml`) only take effect on GitHub** — that's where Actions and Dependabot run; they do nothing on the GitLab side.
+     - **`Dockerfile`, compose, and stack files are host-agnostic** — they take effect via whichever host builds/deploys, so they need to reach *both* hosts to matter on both.
+     - **How they get there depends on the setup:** a *GitLab→GitHub mirror* may carry one push across automatically — say so if that's the case. But many both-hosts users **push to each remote by hand** (no mirror); for them, spell out the split above so the right files reach the right host. This manual-push case is separate from the GitLab-MR *Delivery* path — only walk *Delivery* if the user asked for an MR.
    - The org-level default-token fix in `moat-org-fixer` cascades to all repos and clears `repositories_actions_workflow_token_is_read_only` in one go — recommend it as a complementary safety net. But it does **not** clear `repositories_workflow_permissions_are_restricted` (the per-workflow `permissions:` block we fixed here): the two are different findings, so don't suggest deferring the file fix in favour of the org setting.
 5. **Re-verify (optional)** — offer to re-run `moat --format json <owner>/<repo>` after the user has pushed. Be honest about the caveats: file-level checks (`workflow_actions_are_sha_pinned`, `workflow_permissions_are_restricted`, `have_security_policy`, `have_dependabot_config`) should flip — but only once the fixes land **on the branch moat scans** (the repo's GitHub default; see *Reconcile the scanned branch* — fixing a different local branch won't move them). Anything that reads GitHub-side state (branch protection, org policy) won't change until the matching settings are also updated. The proactive supply-chain hardening (per-ecosystem cooldowns, install-script lockdowns, locked installs, audit tooling, and the stale-pin checks) won't appear in moat output at all — moat doesn't check for any of these, so don't expect any count to drop; the protection is real, just invisible to moat.

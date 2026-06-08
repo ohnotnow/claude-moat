@@ -26,7 +26,8 @@ ignore-scripts=true
 
 **`min-release-age` caveats — say these out loud before applying:**
 
-- It needs **npm ≥ 11.10.0**. Older npm silently ignores the key, so a committed `.npmrc` gives false comfort. Recommend pinning the Node/npm version in CI so the setting actually bites.
+- It needs **npm ≥ 11.10.0**. Older npm silently ignores the key, so a committed `.npmrc` gives false comfort.
+- **`min-release-age` gates version *resolution*, not the build.** It only bites where npm actually *picks* new versions — a developer running `npm install <pkg>` / `npm update`, or Dependabot resolving an update. So the npm that must be ≥ 11.10.0 is **the developers' machines and Dependabot's infra**, *not* the build image. **Bumping the Dockerfile's `node` does nothing for it** — the build runs `npm ci` against the already-locked, already-aged lockfile and never resolves (see *`npm install` → `npm ci`* below). To make the cooldown real, upgrade npm wherever dependencies are resolved, and lean on the Dependabot cooldown for the layer that doesn't depend on anyone's local npm.
 - The value is in **days**. `1` is the floor that catches fast-yanked compromises; 3–7 buys more margin at the cost of lag on legitimate updates. It's a dial — mention it.
 
 **Cooldown ≠ remediation — say this so the `.npmrc` isn't mistaken for a fix.** `min-release-age` and `ignore-scripts` defend against *future* poisoned releases; they do **nothing** for a version already in the tree that's *already* known-vulnerable (a stale `axios`, say). Clearing those is `npm audit` + an actual upgrade, not a cooldown. On a GitLab-only repo there's no Dependabot to raise that upgrade either (see the Dependabot note below), so flag the already-old deps explicitly rather than letting the new `.npmrc` imply they're handled.
