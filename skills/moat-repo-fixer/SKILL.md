@@ -54,6 +54,8 @@ Bucket the remotes by host and decide the **primary remote** — this drives the
 
 (This is the no-GitHub case the top of *Source the findings* routes on: no moat findings — moat only scans GitHub — but the proactive *Supply-chain hardening* still applies and can still be delivered as a GitLab MR, and a dormant `.github/workflows/` gets surfaced rather than silently ignored.)
 
+(If the user has a GitLab remote - you can call on the `glab` skill for guidences with the latest version of the gitlab cli)
+
 ## Filter findings
 
 For each `checks[]` entry where `status == "fail"`, check whether the current repo appears in `affected[]`. A starting `jq` filter:
