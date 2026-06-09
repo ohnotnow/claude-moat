@@ -113,6 +113,7 @@ If moat's `description` or `why_enable` text contains its own caveats, surface t
 | --- | --- |
 | Org-level repository rulesets (`/orgs/<org>/rulesets`) need **GitHub Team or higher**. Free plan returns 403. | Fall back to **per-repo branch protection** (`PUT /repos/<o>/<r>/branches/<b>/protection`). Covers the same four findings (signed, reviews, locked release, linear history), just per-repo instead of cascading. Probe first: `gh api /orgs/<org>/rulesets` — 403 means Free plan. |
 | Advanced Security Configurations on Free plan | Cover public repos only. For private repos on Free, the simple per-new-repo toggles are the best available. List as "plan-tier limitation" in the summary, not a failure. |
+| Pre-defined org **roles** are *not* gated like rulesets | The five `all_repo_*` roles (read/triage/write/maintain/admin) **ARE assignable on GitHub Free** (verified on a real run) — only *custom* org roles need Enterprise Cloud. They're the clean way to give a team all-repo access; see **Direct collaborators** for the commands and caveats. Don't assume "Free = no org roles" the way rulesets are blocked. |
 
 ## Step 5: Walk through each finding
 
@@ -286,6 +287,17 @@ Batch the same way as branch protection.
 3. **Per-person confirmation** before removal. Show username, role, and last-active info if you can get it.
 4. Remove: `gh api -X DELETE /repos/<owner>/<repo>/collaborators/<username>`
 5. If the person legitimately needs access, mention they should be added to a team — but **don't add them yourself**. Team membership is a separate decision.
+
+**Team-based access as the remedy — pre-defined org roles.** When the user wants the removed people (or a whole dev team) to hold access *via a team* instead of direct grants, GitHub's **pre-defined organization roles** are the cleanest mechanism: they grant a team a base role across **all** repos, current *and* future — no per-repo grants, no "watch for new repo" automation.
+
+```
+gh api /orgs/<org>/organization-roles                                       # list roles + ids
+gh api -X PUT    /orgs/<org>/organization-roles/teams/<team_slug>/<role_id> # assign (204, no body)
+gh api /orgs/<org>/organization-roles/<role_id>/teams                       # verify
+gh api -X DELETE /orgs/<org>/organization-roles/teams/<team_slug>/<role_id> # reverse
+```
+
+The five repo roles are `all_repo_read` / `triage` / `write` / `maintain` / `admin` (ids ~8132–8136; confirm via the list call). **These pre-defined roles ARE assignable on GitHub Free** — verified on a real run — unlike org *rulesets* (Team+) and *custom* org roles (Enterprise Cloud only). Caveats to surface: they apply to **all** repos (can't scope to private-only); `all_repo_admin` includes destructive powers, so prefer `all_repo_maintain` unless full admin is genuinely needed; they're **redundant for org owners**, who already have admin on every repo via ownership; and access is **cumulative** — the highest grant always wins, so a team role can never *downgrade* someone's existing higher access. As with team membership, **don't assign a role yourself without the user's say-so** — surface the option and let them decide.
 
 ### Unknown / new findings
 

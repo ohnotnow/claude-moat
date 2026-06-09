@@ -7,6 +7,10 @@ description: Apply in-repo security hardening fixes that Laravel's `moat` CLI fl
 
 Walks through the in-repo fixes that moat (https://github.com/laravel/moat) flags. Strictly file-level changes inside the current repository. Settings-level fixes belong to `moat-org-fixer`.
 
+## Check for prior org context first
+
+Before asking the user anything, **if a cross-project memory tool is available (e.g. the `user-memories` MCP), search it for prior moat/hardening context for this org** — the hosting topology (which remote is primary, GitHub vs GitLab), any settings-level findings that are *deliberate accepted-risk decisions* (so you don't re-propose "fixing" what the team consciously chose to leave), and any "standard recipe" captured from earlier repos (what's usually already hardened, the recurring file-level work, ecosystem quirks). Foregrounding these avoids re-asking settled questions and re-investigating the same facts on every repo in a batch. Treat recalled memories as point-in-time — confirm against the live repo before acting on them.
+
 ## Choose scope first
 
 Use `AskUserQuestion` up front to find out what the user wants:
@@ -121,7 +125,7 @@ git branch --show-current                           # what you have checked out
 
 Across a dozen repos the same identifiers recur constantly — `actions/checkout@v4`, `docker/build-push-action@v6`, `node:22`. Re-resolving each per repo burns time *and* tokens: every `gh api`/registry result lands in context and is re-billed on each later turn, so overlapping refs are paid for over and over. An optional on-disk cache lets a sweep resolve each unique identifier **once**. It covers both this section's action SHAs/metadata and the image digests in `pinned-versions.md`.
 
-- **Single-repo (Mode A) with no prior cache has nothing to reuse — skip it.** The cache earns its keep from the *second* repo on (a Mode B sweep, or repeated Mode A runs over a day or two).
+- **Single-repo (Mode A) with no prior cache has nothing to *reuse* — but still *write* what you resolve (write-through).** The cache earns its keep from the *second* repo on (a Mode B sweep, or repeated Mode A runs over a day or two) — but that only works if the first run *seeded* it. Skipping the write entirely on a lone run defeats the "repeated Mode A" benefit, so seed it anyway unless you're certain this is a genuine one-off with no follow-ups.
 - **Location:** `~/.cache/moat-repo-fixer/pins.tsv`. **Test writability first** — `mkdir -p ~/.cache/moat-repo-fixer 2>/dev/null && [ -w ~/.cache/moat-repo-fixer ]`; if it fails, **silently skip caching and resolve live**. The cache is an optimization, never a correctness dependency, and writes outside the project root may be sandbox-blocked.
 - **Format:** one tab-separated entry per line, with a *per-entry* timestamp so the TTL works granularly:
   ```
