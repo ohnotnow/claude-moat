@@ -9,7 +9,14 @@ Walks through the in-repo fixes that moat (https://github.com/laravel/moat) flag
 
 ## Check for prior org context first
 
-Before asking the user anything, **if a cross-project memory tool is available (e.g. the `user-memories` MCP), search it for prior moat/hardening context for this org** — the hosting topology (which remote is primary, GitHub vs GitLab), any settings-level findings that are *deliberate accepted-risk decisions* (so you don't re-propose "fixing" what the team consciously chose to leave), and any "standard recipe" captured from earlier repos (what's usually already hardened, the recurring file-level work, ecosystem quirks). Foregrounding these avoids re-asking settled questions and re-investigating the same facts on every repo in a batch. Treat recalled memories as point-in-time — confirm against the live repo before acting on them.
+Before asking the user anything, **if a cross-project memory tool is available (e.g. the `user-memories` MCP), search it for prior moat/hardening context for this org.** A plain substring search for **`moat`** is the quickest way in — that's the tag earlier runs recorded under — and it surfaces the handful of memories worth recalling here:
+
+- **hosting topology** — which remote is primary (GitHub vs GitLab) and whether the repos are dual-homed, so you know where `.github/*` changes have to land to take effect;
+- the **"standard recipe"** captured from earlier repos — what's usually already hardened, the recurring file-level work, and per-ecosystem quirks;
+- **batch caveats** — where that recipe must *not* be blind-applied (e.g. frontend stacks that vary repo-to-repo, or which repos do/don't carry a Go CLI);
+- any **settings-level findings that are *deliberate accepted-risk decisions*** — so you don't re-propose "fixing" what the team consciously chose to leave. (Acting on those is `moat-org-fixer`'s job, not this skill's; recalling them here just stops you reporting them as if they were outstanding TODOs.)
+
+Foregrounding these avoids re-asking settled questions and re-investigating the same facts on every repo in a batch. **Treat recalled memories as point-in-time** — they reflect what was true when written, and both their contents and any IDs drift as the user prunes and re-records, so search by topic rather than by ID and confirm against the live repo before acting on them.
 
 ## Choose scope first
 
@@ -121,6 +128,18 @@ git branch --show-current                           # what you have checked out
 
 - Always clean up temp files whether the change was applied, rejected, or errored.
 
+### Fast path: replace an old Docker workflow on a Laravel app
+
+For a **Laravel app** (`composer.json` requiring `laravel/framework`, an `artisan` file), if the existing GitHub workflow **mentions Docker** — building or pushing images (`docker/build-push-action`, `docker build` / `docker push`, a `build-images` job, registry login) — it's the old image-build pipeline, and SHA-pinning its actions one by one is wasted effort on a file that's been superseded by a better one.
+
+So don't grind through pinning/permissions on it. **Offer to replace it wholesale** with the bundled, ready-pinned workflow at `assets/laravel-ci.yml` — a fast PHP-only gate (Pest + Pint + `composer audit`) that's already `contents: read`, already SHA-pinned, and already runs `npm ci --ignore-scripts`. One overwrite replaces the entire pinning + permissions walk for that file.
+
+> Your GitHub workflow (`<file>`) is the old Docker image-build pipeline. Rather than SHA-pin every action in it, I can **replace it wholesale** with a lightweight, ready-pinned `laravel-ci` workflow (Pest + Pint + `composer audit`, `contents: read`). Replace it? (y/n)
+
+On yes, follow the usual preview → confirm → apply: copy the asset to an in-project preview file (`.moat-preview-<name>` next to the target, per the preview mechanics above), `diff -u <existing-workflow> "$preview"` to show the swap, confirm, then `cp "$preview" <existing-workflow> && rm "$preview"`. **Overwrite in place** — keep the existing filename (e.g. `.github/workflows/main.yml`); GitHub shows the workflow by its `name:` key, not the filename, so there's no orphan to clean up.
+
+The asset drops in as-is — the pinned SHAs and the Flux Pro step (`FLUX_USERNAME` / `FLUX_LICENSE_KEY`) are kept. If this repo's PHP or Node differ from the asset's `php-version: '8.4'` / `node-version: '22'`, adjust them in the preview before confirming — the diff makes them visible.
+
 ### Resolution cache (optional — for multi-repo sweeps)
 
 Across a dozen repos the same identifiers recur constantly — `actions/checkout@v4`, `docker/build-push-action@v6`, `node:22`. Re-resolving each per repo burns time *and* tokens: every `gh api`/registry result lands in context and is re-billed on each later turn, so overlapping refs are paid for over and over. An optional on-disk cache lets a sweep resolve each unique identifier **once**. It covers both this section's action SHAs/metadata and the image digests in `pinned-versions.md`.
@@ -141,6 +160,8 @@ Across a dozen repos the same identifiers recur constantly — `actions/checkout
 ### Fix: `repositories_workflow_actions_are_sha_pinned`
 
 (moat renamed this from `repositories_workflow_actions_are_pinned` — match on the current id; older reports may carry the old name.)
+
+**First, the Laravel fast path:** on a Laravel app, if this workflow mentions Docker you may be about to SHA-pin an old image-build file you should replace wholesale — see *Fast path: replace an old Docker workflow* above before grinding through the refs below.
 
 For every `.github/workflows/*.yml`:
 
