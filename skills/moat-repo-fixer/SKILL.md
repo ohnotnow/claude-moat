@@ -18,6 +18,10 @@ Before asking the user anything, **if a cross-project memory tool is available (
 
 Foregrounding these avoids re-asking settled questions and re-investigating the same facts on every repo in a batch. **Treat recalled memories as point-in-time** — they reflect what was true when written, and both their contents and any IDs drift as the user prunes and re-records, so search by topic rather than by ID and confirm against the live repo before acting on them.
 
+## Constrained wrapper: agent-moat
+
+Some users have the `agent-moat` wrapper command installed (it lives in this repo, next to these skills): a narrow, agent-friendly route to the GitHub look-ups this skill needs, for agents that are not given the full `gh` CLI. Check early with `command -v agent-moat`. If it's there, prefer the "with the wrapper" forms shown below; if not, mention that once in passing ("No agent-moat command found, falling back to raw gh") and use the `gh` forms. If an older installed copy refuses a subcommand with "unknown command", fall back to `gh` for that call. This skill's fixes are local file edits, so it only uses the wrapper's read-only look-ups; the settings-level change commands belong to `moat-org-fixer`.
+
 ## Choose scope first
 
 Use `AskUserQuestion` up front to find out what the user wants:
@@ -86,7 +90,8 @@ If no findings apply to this repo, say so and exit.
 Before editing anything, reconcile three things:
 
 ```
-gh api repos/<owner>/<repo> --jq .default_branch   # the branch moat scanned
+agent-moat default-branch <owner>/<repo>            # with the wrapper; otherwise:
+gh api repos/<owner>/<repo> --jq .default_branch    # the branch moat scanned
 git branch --show-current                           # what you have checked out
 ```
 …plus the `affected[].branch` on the findings themselves.
@@ -172,13 +177,16 @@ For every `.github/workflows/*.yml`:
    - Docker (`docker://...`)
 3. For each remaining ref, resolve to a full SHA — **check the resolution cache first** (see *Resolution cache* above); only resolve live on a miss or stale entry:
    ```
-   gh api repos/<owner>/<repo>/commits/<ref> --jq .sha
+   agent-moat pin-info <owner>/<repo> <ref>             # with the wrapper
+   gh api repos/<owner>/<repo>/commits/<ref> --jq .sha  # otherwise
    ```
+   The wrapper's `pin-info` also returns the archived / last-push metadata that step 4 needs, so on that path one call covers both steps.
    **The live calls are independent — fire them in parallel** (one tool message with N Bash calls) rather than serialising 12 round-trips. Write each freshly-resolved SHA back to the cache.
 4. **Check the action isn't stale or archived** (cache key `action-meta` — one call per *action repo*, not per ref, so it dedups hard across a sweep). The repo-metadata call:
    ```
    gh api repos/<owner>/<repo> --jq '{archived, pushed_at}'
    ```
+   (On the wrapper path this arrived with the `pin-info` call in step 3; no separate call needed.)
    Flag (don't auto-skip) any action where `archived: true` or `pushed_at` is more than 2 years ago. These are real supply-chain smells: an abandoned action is one compromise away from being a problem. Surface them to the user with a recommendation to find a maintained alternative before pinning.
 
    **If you suggest a replacement, verify it first** with the same `archived`/`pushed_at` check — don't recommend something from training memory that may itself have gone stale since.
@@ -222,7 +230,8 @@ For every `.github/workflows/*.yml`:
 **Check existence robustly, and cross-check GitHub when moat disagrees with you.** Test the path on its own (`test -f .github/dependabot.yml`) rather than folding it into a combined `ls a b c 2>/dev/null || echo none` — a combined `ls` exits non-zero if *any* listed file is missing, so the `|| echo none` fires even when the file is present and you can end up believing it's absent when it isn't. And if moat **passes** `repositories_have_dependabot_config` while you think there's no local file (or vice-versa), don't carry the contradiction: that's a tell your local tree and GitHub's scanned branch have diverged. Cross-check what GitHub actually serves — the same habit the `SECURITY.md` fix uses below:
 
 ```
-gh api repos/<owner>/<repo>/contents/.github/dependabot.yml --jq .name
+agent-moat file-check <owner>/<repo> .github/dependabot.yml              # with the wrapper
+gh api repos/<owner>/<repo>/contents/.github/dependabot.yml --jq .name   # otherwise
 ```
 
 then reconcile (see *Reconcile the scanned branch*) before editing.
@@ -232,6 +241,8 @@ then reconcile (see *Reconcile the scanned branch*) before editing.
 **Current moat usually *passes* this when an org-wide default exists — so you may not see it as a finding at all.** GitHub serves a default `SECURITY.md` to *every* repo in an org from a special `<owner>/.github` repository (it appears in each repo's Security tab automatically), and moat now reads that inherited default and counts it as satisfied (fixed via [laravel/moat#18](https://github.com/laravel/moat/issues/18), ~June 2026 — *older* moat versions false-positived here, so a pre-fix moat may still flag it).
 
 So the real risk is **drift**: adding a redundant per-repo file that overrides a perfectly good org default. **Check for an org-wide default before writing anything** — it matters most on the *manual fallback path* (moat not installed, so you can't lean on its now-correct pass) and as plain DRY hygiene. `<owner>` is the GitHub owner (from the GitHub remote — see *Detecting the current repo*; not necessarily `origin`); check the canonical locations:
+
+With the wrapper, `agent-moat security-policy <owner>/<repo>` answers all three questions in one command: the repo's own file, the org-wide default from `<owner>/.github`, and what the community profile reports (with the trust-order caveat below baked into its output). Otherwise:
 
 ```
 for p in SECURITY.md .github/SECURITY.md docs/SECURITY.md; do
@@ -257,17 +268,12 @@ Only write a file if the user picks (b). Otherwise record it under "Skipped / de
 
 **To write a repo-specific file** (no org default, or the user chose (b)):
 
-1. Get suggested name and email from the user's git config:
-   ```
-   git config user.name
-   git config user.email
-   ```
-2. Use `AskUserQuestion` to offer these as defaults — the user can confirm with one click. Options:
-   - "Use `<name>` / `<email>`" (the detected values, recommended)
-   - "PVR only — no email contact" (skip the email line entirely)
-   - "Other" — user types preferred values
-3. Copy `assets/SECURITY.md` to the repo root and substitute `[YOUR NAME]` and `your@email.com`. If PVR-only was chosen, remove the entire "Email" bullet.
-4. Preview, confirm, apply.
+1. Use `AskUserQuestion` to ask whether the policy should also carry an email contact. The template routes reporters to GitHub's private vulnerability reporting and deliberately names no person and no email address - publishing a contact email is an identity decision, so it is opt-in. Options:
+   - "PVR only - no email contact" (recommended; use the template as-is)
+   - "Add an email contact" - suggest the values from `git config user.name` / `git config user.email`, letting the user confirm or correct them
+   - "Other" - user types preferred values
+2. Copy `assets/SECURITY.md` to the repo root. If an email contact was chosen, append a line to the "Reporting a vulnerability" section: `If you cannot use GitHub's private reporting, email <name> at <email>.`
+3. Preview, confirm, apply.
 
 ### Fix: `repositories_workflow_permissions_are_restricted`
 
@@ -309,7 +315,7 @@ If a workflow legitimately needs more, keep the grant as narrow as possible and 
 | Anything that pushes commits, tags, or releases | `contents: write` |
 | Anything that comments on or labels PRs/issues | `pull-requests: write` and/or `issues: write` |
 
-If you see an action not in the table, read its `action.yml` (`gh api repos/<owner>/<repo>/contents/action.yml --jq .content | base64 -d`) or its README to figure out what it needs — don't guess by granting `write: all`.
+If you see an action not in the table, read its `action.yml` (`agent-moat show-file <owner>/<repo> action.yml` with the wrapper, or `gh api repos/<owner>/<repo>/contents/action.yml --jq .content | base64 -d`) or its README to figure out what it needs — don't guess by granting `write: all`.
 
 **Multi-job workflows:** set `permissions: contents: read` at the workflow root, and grant elevated permissions at the *job* level only on the jobs that need them. Don't grant the whole workflow `contents: write` just because one job cuts a release — the principle of least privilege applies per-job, not per-workflow.
 

@@ -7,6 +7,20 @@ description: Apply settings-level security hardening fixes that Laravel's `moat`
 
 Walks through the *settings-level* fixes moat (https://github.com/laravel/moat) flags — things that change a config in GitHub itself rather than a file in a repo. File-level fixes belong to the sibling `moat-repo-fixer` skill.
 
+## Constrained wrapper: agent-moat
+
+Some users have the `agent-moat` wrapper command installed (it lives in this repo, next to these skills). It is a narrow, agent-friendly route to the GitHub calls this skill makes, useful where an agent is not given the full `gh` CLI. Its look-ups are read-only, and every change command can only *tighten* security and uses a preview-then-token confirmation, so nothing happens on the first invocation. Check for it early:
+
+```bash
+command -v agent-moat
+```
+
+- **Found**: use it wherever a "with the wrapper" form is shown below. `agent-moat org-settings <org>` is the one-call current-state sweep (workflow token default, security defaults, 2FA requirement, ruleset plan probe). For anything the wrapper doesn't cover (collaborator removal, org rulesets, org roles, brand-new moat findings) use `gh` as shown, or hand-off mode if `gh` isn't available to you either.
+- **Not found**: mention it once, in passing ("No agent-moat command found, falling back to raw gh") then use the `gh` commands shown in each step. Do not pitch it or suggest installing anything.
+- If an older installed copy refuses a subcommand with "unknown command", fall back to the `gh` form for that step.
+
+With the wrapper, apply mode's per-finding flow becomes: run the change command without `--yes` (it prints the current state, the proposed change and a token), show that preview to the user, and on their y/n re-run the identical command with `--yes TOKEN`. The user's confirmation stays; the token is the machinery underneath it.
+
 ## Step 0: Source the findings
 
 Same preference order as `moat-repo-fixer`:
@@ -26,7 +40,8 @@ Same preference order as `moat-repo-fixer`:
 `moat` needs more scopes than a normal `gh auth login` provides. The org-admin endpoints this skill uses require the same scopes even for *reads* (e.g. `gh api /orgs/<org>/actions/permissions/workflow` needs `admin:org`). **Check scopes before doing anything else.**
 
 ```
-gh auth status
+agent-moat auth-status    # with the wrapper (forwards nothing; tokens stay masked)
+gh auth status            # otherwise
 ```
 
 **Required scopes**: `admin:org`, `repo`, `workflow`.
@@ -135,7 +150,8 @@ For every finding: **show current state → show proposed change → surface fri
 
 1. List members currently without 2FA:
    ```
-   gh api '/orgs/<org>/members?filter=2fa_disabled' --jq '.[].login'
+   agent-moat two-factor-stragglers <org>                        # with the wrapper
+   gh api '/orgs/<org>/members?filter=2fa_disabled' --jq '.[].login'   # otherwise
    ```
 2. **Show that list to the user explicitly** — these are the people who get removed from the org on enable. Recommend they confirm individually with each affected member before applying.
 3. Provide the exact UI path in the closing summary:
@@ -153,6 +169,14 @@ List under "Needs UI follow-up" in the summary, not as a failure.
 #### `repositories_actions_workflow_token_is_read_only`
 
 The biggest single-setting win — one call cascades to every repo that hasn't overridden.
+
+With the wrapper, one command handles the whole show-current, preview and apply dance (and the PUT-only and empty-body traps below):
+
+```
+agent-moat harden-workflow-token --org <org>
+```
+
+Otherwise:
 
 ```
 # Current
@@ -172,6 +196,10 @@ This clears `repositories_actions_workflow_token_is_read_only` for every repo th
 
 These pass per-repo but moat flags "default policy missing" — new repos won't inherit the setting.
 
+With the wrapper, `agent-moat enable-security-defaults --org <org>` covers these two AND the dependabot default below in one preview-and-apply (the same batching the confirmation guidance in Step 5 asks for).
+
+Otherwise:
+
 ```
 # Current
 gh api /orgs/<org> --jq '{secret_scanning_enabled_for_new_repositories, secret_scanning_push_protection_enabled_for_new_repositories}'
@@ -184,7 +212,7 @@ gh api -X PATCH /orgs/<org> \
 
 #### `repositories_dependabot_security_updates_are_enabled`
 
-Same pattern:
+Same pattern (and already covered by the wrapper's `enable-security-defaults` above):
 
 ```
 gh api -X PATCH /orgs/<org> \
@@ -194,6 +222,8 @@ gh api -X PATCH /orgs/<org> \
 #### `repositories_private_vulnerability_reporting_is_enabled`
 
 Per-repo, with a clean REST endpoint. moat usually reports this as "enabled by default org-wide, but N repos override it" — so the fix is per-repo on the named repos:
+
+With the wrapper: `agent-moat enable-vuln-reporting --repo <owner>/<repo>` (idempotent, applies directly; the sibling `agent-github` tool carries the same command). Otherwise:
 
 ```
 # Current
@@ -236,6 +266,8 @@ If the user already has legacy per-repo branch protection, extend that rather th
 
 **Critical**: `PUT /repos/<owner>/<repo>/branches/<branch>/protection` is **replace-semantics**, not patch. Always GET the current protection, merge in the requested changes, then PUT the merged result. Never PUT a fresh config that doesn't include the user's existing rules — that nukes them silently.
 
+With the wrapper, `agent-moat protect-branch --repo <o>/<r> --branch <b>` with the matching flags (`--require-signed`, `--require-reviews N`, `--linear-history`, `--lock-branch`) does the GET-merge-PUT itself: it builds the replacement body from the current rules plus the requested ones, so existing protections cannot be silently dropped, and its confirmation token is bound to the current config. Read the current rules with `agent-moat branch-protection <o>/<r> <b>`. Use the `gh` route below only where the wrapper is missing or a rule it doesn't offer is needed.
+
 **Nested bodies need `--input -`, not `-F` flags.** Branch protection's `required_pull_request_reviews` is a nested object; `gh api -F` can't form-encode it. Use a heredoc:
 
 ```
@@ -265,6 +297,8 @@ For batched application across N repos that all need the same rule:
 
 The org-wide PUT (above) covers every repo that *inherits* the org default. A repo that has explicitly **overridden** its default token to `write` still shows under `repositories_actions_workflow_token_is_read_only` after the org change — fix those stragglers per-repo:
 
+With the wrapper: `agent-moat harden-workflow-token --repo <owner>/<repo>`. Otherwise:
+
 ```
 gh api -X PUT /repos/<owner>/<repo>/actions/permissions/workflow \
   -F default_workflow_permissions=read \
@@ -281,11 +315,12 @@ Batch the same way as branch protection.
 
 1. List current collaborators per affected repo:
    ```
-   gh api /repos/<owner>/<repo>/collaborators
+   agent-moat collaborators <owner>/<repo>      # with the wrapper (lists direct collaborators only)
+   gh api /repos/<owner>/<repo>/collaborators   # otherwise
    ```
 2. Identify which are "direct" (`role_name` of `admin`/`write`/`triage`/`maintain` and not via team) versus inherited from teams.
 3. **Per-person confirmation** before removal. Show username, role, and last-active info if you can get it.
-4. Remove: `gh api -X DELETE /repos/<owner>/<repo>/collaborators/<username>`
+4. Remove: `gh api -X DELETE /repos/<owner>/<repo>/collaborators/<username>` (deliberately absent from the wrapper: removing a person's access stays with `gh` or the human)
 5. If the person legitimately needs access, mention they should be added to a team — but **don't add them yourself**. Team membership is a separate decision.
 
 **Team-based access as the remedy — pre-defined org roles.** When the user wants the removed people (or a whole dev team) to hold access *via a team* instead of direct grants, GitHub's **pre-defined organization roles** are the cleanest mechanism: they grant a team a base role across **all** repos, current *and* future — no per-repo grants, no "watch for new repo" automation.

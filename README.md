@@ -18,7 +18,7 @@ moat tells you *what* to fix. The skills in this repository are about *applying*
 
 ## What's in this repository
 
-Three Claude Code skills, living under `skills/`. The first two apply fixes - one at the file level, one at the settings level - and the third keeps those fixes from going stale, because hardening is not a thing you do once.
+Three Claude Code skills, living under `skills/`. The first two apply fixes - one at the file level, one at the settings level - and the third keeps those fixes from going stale, because hardening is not a thing you do once. There is also a small CLI wrapper, `agent-moat`, at the repository root, for setups where the agent should not get the full `gh` CLI - see below.
 
 ### moat-repo-fixer
 
@@ -66,7 +66,7 @@ The CSV goes to stdout (pipe it, or redirect with `> repo_map.csv`); a counts li
 
 ### moat-org-fixer
 
-Handles organisation-level and repository-settings fixes via `gh api`, falling back to Chrome DevTools MCP for items that only exist in the web UI. What it does:
+Handles organisation-level and repository-settings fixes via `gh api` (or the `agent-moat` wrapper when it is installed), falling back to Chrome DevTools MCP for items that only exist in the web UI. What it does:
 
 - Auth pre-flight. Refuses to start until the required scopes (`admin:org`, `repo`, `workflow`) are present on your `gh` token.
 - Mode choice. Either "apply changes" (the skill runs each command after your confirmation) or "hand-off" (the skill produces the commands and you run them yourself).
@@ -89,6 +89,23 @@ The maintenance leg. `moat-repo-fixer` *creates* pins; this skill *refreshes* th
 Major-version action jumps get called out explicitly in the confirmation rather than waved through, for the same reason tags are sacred: majors change inputs and behaviour, and taking one should be a choice.
 
 The conventions are the same as its siblings: preview-and-confirm one file at a time, graceful degradation when a tool is missing (it does the halves it can and says plainly what it skipped), and no git mutations - committing is yours. It runs against a single named pin ("bump the node pin"), the whole repo, or a fleet sweep across your local checkouts, reusing `moat-repo-fixer`'s repo mapper for the latter.
+
+### agent-moat (optional CLI wrapper)
+
+Not a skill: a single bash script at the repository root that wraps the fixed set of GitHub API calls the two moat skills make. It exists for setups where handing an agent the full `gh` CLI is not acceptable - a `gh` authenticated as an org admin can do anything to anything, and a wrapper with an enumerable command list is an easier thing to put in front of a security team than "trust the prompt".
+
+The shape of it:
+
+- The look-up commands are read-only: resolve a tag to a commit SHA, read an org's security settings, list members without 2FA, list direct collaborators, show a branch's current protection, and so on.
+- Every change command can only tighten security: set the Actions workflow token to read-only, enable the secret scanning / push protection / dependabot defaults, enable private vulnerability reporting, add branch protection rules. Nothing in it can loosen a setting, delete anything, or remove a person's access.
+- Changes preview first and print a confirmation token bound to the state they saw; re-running the identical command with `--yes TOKEN` applies it, and the apply refuses if anything changed in between. `protect-branch` builds its replacement body from the current rules plus the requested ones, so the GitHub API's replace-the-whole-config semantics cannot silently drop existing protections.
+- There is no argument pass-through to `gh` and no arbitrary API access.
+
+The header comment of the script is the full contract, including what is deliberately missing - it doubles as the document to show whoever signs off on agent access. One honest caveat to pair with it: the wrapper narrows what the *agent* can invoke, but the `gh` token underneath keeps whatever power its scopes grant. If you want the same property one layer down, authenticate `gh` with a fine-grained PAT or a GitHub App restricted to the permissions the wrapper actually needs.
+
+Both skills check for the wrapper (`command -v agent-moat`) and prefer it when present, falling back to plain `gh` when not - installing it is optional.
+
+It needs `bash` 3.2+, an authenticated `gh`, `git` (only to compute the confirmation tokens) and `jq` (only for `protect-branch`).
 
 ## How it was built
 
@@ -139,6 +156,20 @@ ln -s "$PWD/claude-moat/skills/moat-repo-fixer" ~/.claude/skills/moat-repo-fixer
 ln -s "$PWD/claude-moat/skills/moat-org-fixer" ~/.claude/skills/moat-org-fixer
 ln -s "$PWD/claude-moat/skills/bump-pins" ~/.claude/skills/bump-pins
 ```
+
+To install the optional `agent-moat` wrapper, put it anywhere on your `PATH`:
+
+```bash
+install -m 0755 agent-moat /usr/local/bin/agent-moat
+```
+
+Or symlink it from the clone if you would rather track upstream changes:
+
+```bash
+ln -s "$PWD/claude-moat/agent-moat" /usr/local/bin/agent-moat
+```
+
+The skills detect it at runtime and fall back to plain `gh` when it is absent, so nothing breaks without it.
 
 ## Usage
 

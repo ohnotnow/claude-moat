@@ -1,13 +1,9 @@
-# Security Policy
+# Security policy
 
-**PLEASE DON'T DISCLOSE SECURITY-RELATED ISSUES PUBLICLY, [SEE BELOW](#reporting-a-vulnerability).**
+Please do not report security problems through public GitHub issues, discussions, or pull requests.
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-If you discover a security vulnerability, please report it privately using one of the following channels:
+Go to the repository's **Security** tab and choose **Report a vulnerability**. This uses GitHub's private vulnerability reporting, so the report and everything that follows - triage, the fix, and a CVE if one is warranted - stays between you and the maintainers until a fix is released.
 
-1. **GitHub Private Vulnerability Reporting** (preferred) — go to the repository's **Security** tab and click **"Report a vulnerability"**. This creates a private advisory visible only to maintainers and provides a structured workflow for triage, fix coordination, and CVE assignment.
-
-2. **Email** — send the details to [YOUR NAME] at **your@email.com**.
-
-All security vulnerabilities will be promptly addressed.
+Please include enough detail to reproduce the problem: the affected version or commit, the steps to reproduce, and what an attacker would gain.

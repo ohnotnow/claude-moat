@@ -1,0 +1,1025 @@
+#!/bin/bash
+#
+# agent-moat - the GitHub look-ups and the small set of security-tightening
+# changes that the moat-repo-fixer and moat-org-fixer skills need, without
+# giving an agent access to the full gh CLI.
+#
+# Look-up commands (read-only):
+#   agent-moat auth-status
+#   agent-moat owners
+#   agent-moat pin-info OWNER/REPO REF
+#   agent-moat default-branch OWNER/REPO
+#   agent-moat security-policy OWNER/REPO
+#   agent-moat file-check OWNER/REPO PATH
+#   agent-moat show-file OWNER/REPO PATH
+#   agent-moat org-settings ORG
+#   agent-moat two-factor-stragglers ORG
+#   agent-moat collaborators OWNER/REPO
+#   agent-moat branch-protection OWNER/REPO BRANCH
+#
+# Change commands (preview first, then re-run with --yes TOKEN):
+#   agent-moat harden-workflow-token --org ORG [--yes TOKEN]
+#   agent-moat harden-workflow-token --repo OWNER/REPO [--yes TOKEN]
+#   agent-moat enable-security-defaults --org ORG [--yes TOKEN]
+#   agent-moat enable-vuln-reporting --repo OWNER/NAME
+#   agent-moat protect-branch --repo OWNER/REPO --branch NAME \
+#       [--require-signed] [--require-reviews N] [--linear-history] \
+#       [--lock-branch] [--yes TOKEN]
+#
+# Contract:
+#   * Every command wraps a fixed set of GitHub API calls. Nothing else is
+#     reachable through this tool; no argument is ever passed through to gh.
+#   * The look-up commands are read-only.
+#   * Every change command can only tighten security. There is no command
+#     that loosens a setting, disables a protection, deletes anything, or
+#     removes a person's access.
+#   * Change commands show a preview and print a confirmation token; the
+#     same command re-run with --yes TOKEN applies it. The token is bound
+#     to the target and to the state seen at preview time, so the apply
+#     refuses if anything changed in between. (enable-vuln-reporting is
+#     the one exception: it is an idempotent "turn on" with nothing to
+#     lose, so it applies directly, matching agent-github.)
+#   * protect-branch builds its replacement body from the CURRENT rules
+#     plus the requested ones. The GitHub API replaces the whole
+#     configuration on write; this tool never writes a body it did not
+#     derive from the current state, so existing rules cannot be silently
+#     dropped, and the requested rules only ever add or raise, never
+#     remove or lower.
+#   * Deliberately missing: removing collaborators (the collaborators
+#     command prints the command a human would run), deleting or renaming
+#     repositories, changing visibility, editing org rulesets, enforcing
+#     two-factor (UI-only, and it ejects members), and arbitrary API
+#     access.
+#
+# Exit codes: 0 success/preview; 1 refusal or operational error;
+#             2 confirmation token mismatch (change commands only).
+#             file-check: 0 the file exists; 1 it does not (or error).
+#
+# Requirements: /bin/bash 3.2+, gh CLI authenticated with GitHub,
+#               git (used only to compute confirmation tokens),
+#               jq (protect-branch only).
+
+PROG="agent-moat"
+NL='
+'
+
+die() { printf '%s: %s\n' "$PROG" "$1" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+agent-moat - safe GitHub access for the moat hardening skills.
+
+Look-ups (read-only, always allowed):
+  auth-status                          gh login state, tokens masked
+  owners                               your account and organisations
+  pin-info OWNER/REPO REF              resolve a tag or branch to a full
+                                       commit SHA; warns if the repository
+                                       is archived
+  default-branch OWNER/REPO            the repository's default branch
+  security-policy OWNER/REPO           where (if anywhere) GitHub finds a
+                                       SECURITY.md for this repository
+  file-check OWNER/REPO PATH           does this file exist on GitHub?
+  show-file OWNER/REPO PATH            print a file as GitHub serves it
+  org-settings ORG                     the organisation's security settings
+  two-factor-stragglers ORG            members without two-factor auth
+  collaborators OWNER/REPO             direct collaborators on a repository
+  branch-protection OWNER/REPO BRANCH  current protection rules on a branch
+
+Changes (each previews first; re-run with --yes TOKEN to apply):
+  harden-workflow-token --org ORG | --repo OWNER/REPO
+                                       set the Actions token to read-only
+  enable-security-defaults --org ORG   secret scanning, push protection and
+                                       dependabot updates for new repos
+  enable-vuln-reporting --repo OWNER/REPO
+                                       private vulnerability reporting
+                                       (idempotent, applies directly)
+  protect-branch --repo OWNER/REPO --branch NAME
+      [--require-signed] [--require-reviews N] [--linear-history]
+      [--lock-branch]
+                                       add protection rules to a branch;
+                                       existing rules are never removed
+                                       or weakened
+
+Every change can only tighten security. There are deliberately no commands
+for removing access, deleting anything, loosening a setting, or calling
+arbitrary GitHub APIs.
+EOF
+}
+
+need_gh() {
+    command -v gh >/dev/null 2>&1 || die 'gh CLI is required but was not found on PATH'
+}
+
+need_git() {
+    command -v git >/dev/null 2>&1 || die 'git is required (to compute confirmation tokens) but was not found on PATH'
+}
+
+need_jq() {
+    command -v jq >/dev/null 2>&1 || die 'jq is required for protect-branch but was not found on PATH'
+}
+
+# Run a gh read call keeping stdout and stderr apart, so a failure can
+# report gh's actual error. An HTTP 503 during a GitHub outage reads very
+# differently from an authentication problem, and the agent running this
+# may have no other way to see the difference.
+gh_read() {
+    gh_err_file=$(mktemp) || die 'could not create a temporary file'
+    GH_OUT=$(gh "$@" 2>"$gh_err_file")
+    gh_rc=$?
+    GH_ERR=$(cat "$gh_err_file")
+    rm -f "$gh_err_file"
+    return "$gh_rc"
+}
+
+load_owners() {
+    need_gh
+    gh_read api user --jq '.login' ||
+        die "could not read the authenticated GitHub account${GH_ERR:+: $GH_ERR}; try: agent-moat auth-status"
+    AUTH_OWNER=$GH_OUT
+    case "$AUTH_OWNER" in
+        ''|*"$NL"*) die 'gh returned an invalid authenticated account login' ;;
+    esac
+
+    gh_read api user/memberships/orgs --paginate --jq '.[].organization.login' ||
+        die "could not read GitHub organisation memberships${GH_ERR:+: $GH_ERR}"
+    ORG_OWNERS=$GH_OUT
+}
+
+print_owners() {
+    load_owners
+    printf 'authenticated account:\n    %s\n' "$AUTH_OWNER"
+    if [ -n "$ORG_OWNERS" ]; then
+        printf 'organisations:\n'
+        printf '%s\n' "$ORG_OWNERS" | while IFS= read -r org; do
+            [ -n "$org" ] && printf '    %s\n' "$org"
+        done
+    else
+        printf 'organisations:\n    (none)\n'
+    fi
+}
+
+owner_is_allowed() {
+    [ "$REPO_OWNER" = "$AUTH_OWNER" ] && return 0
+    while IFS= read -r org; do
+        [ -n "$org" ] && [ "$REPO_OWNER" = "$org" ] && return 0
+    done <<EOF
+$ORG_OWNERS
+EOF
+    return 1
+}
+
+org_is_member() {
+    while IFS= read -r org; do
+        [ -n "$org" ] && [ "$1" = "$org" ] && return 0
+    done <<EOF
+$ORG_OWNERS
+EOF
+    return 1
+}
+
+# Validate an OWNER/NAME target and split it into REPO_OWNER and REPO_NAME.
+parse_target() {
+    case "$1" in
+        */*) ;;
+        *) die "invalid repository '$1': expected OWNER/NAME" ;;
+    esac
+    REPO_OWNER=${1%%/*}
+    REPO_NAME=${1#*/}
+    case "$REPO_NAME" in
+        */*|'') die "invalid repository '$1': expected exactly OWNER/NAME" ;;
+    esac
+    case "$REPO_NAME" in
+        .|..) die "invalid repository name '$REPO_NAME'" ;;
+    esac
+    if ! [[ "$REPO_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        die "invalid repository name '$REPO_NAME': use letters, numbers, '.', '_' or '-'"
+    fi
+    if ! [[ "$REPO_OWNER" =~ ^[A-Za-z0-9-]+$ ]]; then
+        die "invalid owner '$REPO_OWNER': use letters, numbers or '-'"
+    fi
+}
+
+validate_org() {
+    case "$1" in
+        -*|'') die "invalid organisation name '$1'" ;;
+    esac
+    [[ "$1" =~ ^[A-Za-z0-9-]+$ ]] || die "invalid organisation name '$1'"
+}
+
+validate_branch() {
+    case "$1" in
+        -*|''|*..*) die "invalid branch name '$1'" ;;
+    esac
+    [[ "$1" =~ ^[A-Za-z0-9._/-]+$ ]] || die "invalid branch name '$1'"
+}
+
+validate_path() {
+    case "$1" in
+        -*|/*|''|*..*) die "invalid path '$1'" ;;
+    esac
+    case "$1" in
+        *[[:space:]]*) die "invalid path '$1': no whitespace" ;;
+    esac
+}
+
+confirmation_token() {
+    need_git
+    git hash-object --stdin | cut -c1-8
+}
+
+# ---------------------------------------------------------------- look-ups
+
+pin_info() {
+    [ $# -eq 2 ] || die 'usage: agent-moat pin-info OWNER/REPO REF'
+    TARGET=$1
+    REF=$2
+    parse_target "$TARGET"
+    case "$REF" in
+        -*|''|*..*) die "invalid ref '$REF'" ;;
+    esac
+    [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || die "invalid ref '$REF'"
+    REF_ENC=${REF//\//%2F}
+
+    need_gh
+    gh_read api "repos/$TARGET/commits/$REF_ENC" --jq '.sha' ||
+        die "could not resolve '$REF' in $TARGET${GH_ERR:+: $GH_ERR}"
+    SHA=$GH_OUT
+
+    gh_read api "repos/$TARGET" --jq '[(.archived | tostring), (.pushed_at // "unknown")] | @tsv' ||
+        die "could not read repository details for $TARGET${GH_ERR:+: $GH_ERR}"
+    IFS=$(printf '\t') read -r ARCHIVED PUSHED <<EOF
+$GH_OUT
+EOF
+
+    printf 'repository:  %s\n' "$TARGET"
+    printf 'ref:         %s\n' "$REF"
+    printf 'commit sha:  %s\n' "$SHA"
+    printf 'archived:    %s\n' "$ARCHIVED"
+    printf 'last push:   %s\n' "$PUSHED"
+    if [ "$ARCHIVED" = "true" ]; then
+        printf '\nwarning: this repository is ARCHIVED. Prefer a maintained alternative before pinning to it.\n'
+    fi
+}
+
+default_branch() {
+    [ $# -eq 1 ] || die 'usage: agent-moat default-branch OWNER/REPO'
+    parse_target "$1"
+    need_gh
+    gh_read api "repos/$1" --jq '.default_branch' ||
+        die "could not read the default branch of $1${GH_ERR:+: $GH_ERR}"
+    printf '%s\n' "$GH_OUT"
+}
+
+security_policy() {
+    [ $# -eq 1 ] || die 'usage: agent-moat security-policy OWNER/REPO'
+    TARGET=$1
+    parse_target "$TARGET"
+    need_gh
+
+    printf 'policy in the repository itself:\n'
+    FOUND=""
+    for p in SECURITY.md .github/SECURITY.md docs/SECURITY.md; do
+        if gh_read api "repos/$TARGET/contents/$p" --jq '.html_url'; then
+            FOUND=$GH_OUT
+            printf '    %s\n' "$FOUND"
+            break
+        fi
+    done
+    [ -n "$FOUND" ] || printf '    (none at SECURITY.md, .github/SECURITY.md or docs/SECURITY.md)\n'
+
+    printf 'org-wide default from %s/.github:\n' "$REPO_OWNER"
+    FOUND=""
+    for p in SECURITY.md .github/SECURITY.md docs/SECURITY.md; do
+        if gh_read api "repos/$REPO_OWNER/.github/contents/$p" --jq '.html_url'; then
+            FOUND=$GH_OUT
+            printf '    %s\n' "$FOUND"
+            break
+        fi
+    done
+    [ -n "$FOUND" ] || printf '    (none)\n'
+
+    printf "what GitHub's community profile reports:\n"
+    if gh_read api "repos/$TARGET/community/profile" --jq '.files.security_policy.html_url // "none"'; then
+        printf '    %s\n' "$GH_OUT"
+        printf '    (this endpoint can lag; trust the two checks above when they disagree)\n'
+    else
+        printf '    could not read%s\n' "${GH_ERR:+: $GH_ERR}"
+    fi
+}
+
+file_check() {
+    [ $# -eq 2 ] || die 'usage: agent-moat file-check OWNER/REPO PATH'
+    parse_target "$1"
+    validate_path "$2"
+    need_gh
+    if gh_read api "repos/$1/contents/$2" --jq 'if type == "array" then "directory" else (.type // "file") end'; then
+        printf '%s: exists (%s) on the default branch of %s\n' "$2" "$GH_OUT" "$1"
+        exit 0
+    fi
+    case "$GH_ERR" in
+        *'HTTP 404'*)
+            printf '%s: not found on the default branch of %s\n' "$2" "$1"
+            exit 1
+            ;;
+        *)
+            die "could not check $2 in $1${GH_ERR:+: $GH_ERR}"
+            ;;
+    esac
+}
+
+show_file() {
+    [ $# -eq 2 ] || die 'usage: agent-moat show-file OWNER/REPO PATH'
+    parse_target "$1"
+    validate_path "$2"
+    need_gh
+    gh_read api "repos/$1/contents/$2" --jq 'if type == "array" then "" else (.content // "") end' ||
+        die "could not read $2 in $1${GH_ERR:+: $GH_ERR}"
+    [ -n "$GH_OUT" ] || die "$2 in $1 is a directory or has no inline content (files over 1MB are not served this way)"
+    if ! printf '%s\n' "$GH_OUT" | base64 -d 2>/dev/null; then
+        printf '%s\n' "$GH_OUT" | base64 -D 2>/dev/null ||
+            die "could not decode the content of $2"
+    fi
+}
+
+show_reported() {
+    case "$1" in
+        null|'') printf 'not reported (the token may lack admin:org)' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+org_settings() {
+    [ $# -eq 1 ] || die 'usage: agent-moat org-settings ORG'
+    ORG=$1
+    validate_org "$ORG"
+    need_gh
+
+    printf 'organisation: %s\n\n' "$ORG"
+
+    printf 'security defaults:\n'
+    if gh_read api "orgs/$ORG" --jq '[(.two_factor_requirement_enabled | tostring), (.secret_scanning_enabled_for_new_repositories | tostring), (.secret_scanning_push_protection_enabled_for_new_repositories | tostring), (.dependabot_security_updates_enabled_for_new_repositories | tostring)] | @tsv'; then
+        IFS=$(printf '\t') read -r TFA SCAN PUSHPROT DEPBOT <<EOF
+$GH_OUT
+EOF
+        printf '    two-factor required for members:            %s\n' "$(show_reported "$TFA")"
+        printf '    secret scanning for new repos:              %s\n' "$(show_reported "$SCAN")"
+        printf '    secret push protection for new repos:       %s\n' "$(show_reported "$PUSHPROT")"
+        printf '    dependabot security updates for new repos:  %s\n' "$(show_reported "$DEPBOT")"
+    else
+        printf '    could not read%s\n' "${GH_ERR:+: $GH_ERR}"
+    fi
+
+    printf 'actions workflow token default:\n'
+    if gh_read api "orgs/$ORG/actions/permissions/workflow" --jq '[.default_workflow_permissions, (.can_approve_pull_request_reviews | tostring)] | @tsv'; then
+        IFS=$(printf '\t') read -r PERMS APPROVE <<EOF
+$GH_OUT
+EOF
+        printf '    default permissions:        %s\n' "$PERMS"
+        printf '    can approve pull requests:  %s\n' "$APPROVE"
+    else
+        printf '    could not read (needs admin:org on the token)%s\n' "${GH_ERR:+: $GH_ERR}"
+    fi
+
+    printf 'org rulesets:\n'
+    if gh_read api "orgs/$ORG/rulesets" --jq 'length'; then
+        printf '    %s ruleset(s) configured\n' "$GH_OUT"
+    else
+        case "$GH_ERR" in
+            *'HTTP 403'*)
+                printf '    not available on this GitHub plan (org rulesets need Team or higher)\n'
+                ;;
+            *)
+                printf '    could not read%s\n' "${GH_ERR:+: $GH_ERR}"
+                ;;
+        esac
+    fi
+}
+
+two_factor_stragglers() {
+    [ $# -eq 1 ] || die 'usage: agent-moat two-factor-stragglers ORG'
+    ORG=$1
+    validate_org "$ORG"
+    need_gh
+    gh_read api "orgs/$ORG/members?filter=2fa_disabled" --paginate --jq '.[].login' ||
+        die "could not list members without two-factor (this needs org owner access)${GH_ERR:+: $GH_ERR}"
+    if [ -z "$GH_OUT" ]; then
+        printf 'every member of %s has two-factor authentication enabled\n' "$ORG"
+        return
+    fi
+    COUNT=$(printf '%s\n' "$GH_OUT" | grep -c .)
+    printf '%s member(s) of %s without two-factor authentication:\n' "$COUNT" "$ORG"
+    printf '%s\n' "$GH_OUT" | while IFS= read -r login; do
+        [ -n "$login" ] && printf '    %s\n' "$login"
+    done
+    printf '\nthese members would LOSE ACCESS to the organisation if two-factor were enforced.\n'
+}
+
+collaborators_cmd() {
+    [ $# -eq 1 ] || die 'usage: agent-moat collaborators OWNER/REPO'
+    TARGET=$1
+    parse_target "$TARGET"
+    need_gh
+    gh_read api "repos/$TARGET/collaborators?affiliation=direct" --paginate --jq '.[] | .login + "  (" + .role_name + ")"' ||
+        die "could not list collaborators for $TARGET${GH_ERR:+: $GH_ERR}"
+    if [ -z "$GH_OUT" ]; then
+        printf '%s has no direct collaborators\n' "$TARGET"
+        return
+    fi
+    printf 'direct collaborators on %s:\n' "$TARGET"
+    printf '%s\n' "$GH_OUT" | while IFS= read -r line; do
+        [ -n "$line" ] && printf '    %s\n' "$line"
+    done
+    printf '\nagent-moat has no command that removes access. If a removal is wanted,\na human can run:\n    gh api -X DELETE repos/%s/collaborators/USERNAME\n' "$TARGET"
+}
+
+branch_protection() {
+    [ $# -eq 2 ] || die 'usage: agent-moat branch-protection OWNER/REPO BRANCH'
+    TARGET=$1
+    BRANCH=$2
+    parse_target "$TARGET"
+    validate_branch "$BRANCH"
+    need_gh
+    BR_ENC=${BRANCH//\//%2F}
+    if gh_read api "repos/$TARGET/branches/$BR_ENC/protection"; then
+        printf '%s\n' "$GH_OUT"
+        return
+    fi
+    case "$GH_ERR" in
+        *'Branch not protected'*)
+            printf 'branch %s of %s has no protection rules\n' "$BRANCH" "$TARGET"
+            ;;
+        *'HTTP 404'*)
+            die "could not read protection for $BRANCH of $TARGET: reading branch protection needs admin access to the repository (and the branch must exist)"
+            ;;
+        *)
+            die "could not read protection for $BRANCH of $TARGET${GH_ERR:+: $GH_ERR}"
+            ;;
+    esac
+}
+
+# ----------------------------------------------------------------- changes
+
+harden_workflow_token() {
+    ORG=""
+    TARGET=""
+    TOKEN_GIVEN=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --org=*)
+                [ -z "$ORG" ] || die '--org may only be given once'
+                ORG=${1#--org=}
+                ;;
+            --org)
+                shift
+                [ $# -gt 0 ] || die '--org needs an organisation name'
+                [ -z "$ORG" ] || die '--org may only be given once'
+                ORG=$1
+                ;;
+            --repo=*)
+                [ -z "$TARGET" ] || die '--repo may only be given once'
+                TARGET=${1#--repo=}
+                ;;
+            --repo)
+                shift
+                [ $# -gt 0 ] || die '--repo needs OWNER/NAME'
+                [ -z "$TARGET" ] || die '--repo may only be given once'
+                TARGET=$1
+                ;;
+            --yes=*)
+                [ -z "$TOKEN_GIVEN" ] || die '--yes may only be given once'
+                TOKEN_GIVEN=${1#--yes=}
+                ;;
+            --yes)
+                shift
+                [ $# -gt 0 ] || die '--yes needs the token printed by the preview'
+                [ -z "$TOKEN_GIVEN" ] || die '--yes may only be given once'
+                TOKEN_GIVEN=$1
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "unknown option '$1'"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -n "$ORG" ] && [ -n "$TARGET" ]; then
+        die 'use --org or --repo, not both'
+    fi
+    [ -n "$ORG" ] || [ -n "$TARGET" ] || die 'one of --org ORG or --repo OWNER/NAME is required'
+
+    load_owners
+    if [ -n "$ORG" ]; then
+        validate_org "$ORG"
+        org_is_member "$ORG" ||
+            die "'$ORG' is not one of your organisations (see: agent-moat owners). For a personal repository use --repo OWNER/NAME."
+        ENDPOINT="orgs/$ORG/actions/permissions/workflow"
+        LABEL="organisation $ORG"
+        SCOPE_NOTE="every repository that inherits the organisation default"
+    else
+        parse_target "$TARGET"
+        owner_is_allowed ||
+            die "owner '$REPO_OWNER' is not the authenticated account or an available organisation"
+        ENDPOINT="repos/$TARGET/actions/permissions/workflow"
+        LABEL="repository $TARGET"
+        SCOPE_NOTE="every workflow in this repository that does not set its own permissions block"
+    fi
+
+    gh_read api "$ENDPOINT" --jq '[.default_workflow_permissions, (.can_approve_pull_request_reviews | tostring)] | @tsv' ||
+        die "could not read the current workflow token settings for $LABEL${GH_ERR:+: $GH_ERR}"
+    CURRENT=$GH_OUT
+    IFS=$(printf '\t') read -r PERMS APPROVE <<EOF
+$CURRENT
+EOF
+
+    if [ "$PERMS" = "read" ] && [ "$APPROVE" = "false" ]; then
+        printf '%s: the workflow token for %s is already read-only and cannot approve pull requests; nothing to do\n' "$PROG" "$LABEL"
+        exit 0
+    fi
+
+    TOKEN=$({
+        printf 'action\0harden-workflow-token\0'
+        printf 'endpoint\0%s\0' "$ENDPOINT"
+        printf 'authenticated-owner\0%s\0' "$AUTH_OWNER"
+        printf 'current\0%s\0' "$CURRENT"
+    } | confirmation_token)
+    [ -n "$TOKEN" ] || die 'failed to compute confirmation token'
+
+    if [ -n "$TOKEN_GIVEN" ]; then
+        if [ "$TOKEN_GIVEN" != "$TOKEN" ]; then
+            printf '%s: token mismatch - the target or its settings changed since the preview.\n' "$PROG" >&2
+            printf '%s: nothing changed. Re-run without --yes for a fresh preview.\n' "$PROG" >&2
+            exit 2
+        fi
+        # This endpoint is PUT with the full body; PATCH returns 404, and a
+        # successful PUT returns an empty body, hence the verify read below.
+        gh_read api -X PUT "$ENDPOINT" \
+            -F default_workflow_permissions=read \
+            -F can_approve_pull_request_reviews=false ||
+            die "could not update the workflow token settings for $LABEL${GH_ERR:+: $GH_ERR}"
+        gh_read api "$ENDPOINT" --jq '[.default_workflow_permissions, (.can_approve_pull_request_reviews | tostring)] | @tsv' ||
+            die "the update ran but the verify read failed${GH_ERR:+: $GH_ERR}; inspect $LABEL manually"
+        IFS=$(printf '\t') read -r PERMS APPROVE <<EOF
+$GH_OUT
+EOF
+        if [ "$PERMS" = "read" ] && [ "$APPROVE" = "false" ]; then
+            printf '%s: the workflow token for %s is now read-only and cannot approve pull requests\n' "$PROG" "$LABEL"
+            exit 0
+        fi
+        die "the update did not stick (now: permissions=$PERMS, can approve=$APPROVE); inspect $LABEL manually"
+    fi
+
+    printf '%s - preview only, nothing changed yet\n\n' "$PROG"
+    printf 'target:\n    %s\n' "$LABEL"
+    printf 'current:\n'
+    printf '    default token permissions:  %s\n' "$PERMS"
+    printf '    can approve pull requests:  %s\n' "$APPROVE"
+    printf 'proposed:\n'
+    printf '    default token permissions:  read\n'
+    printf '    can approve pull requests:  false\n'
+    printf 'affects:\n    %s\n' "$SCOPE_NOTE"
+    printf '\nTo apply exactly this change, re-run the same command with:  --yes %s\n' "$TOKEN"
+}
+
+enable_security_defaults() {
+    ORG=""
+    TOKEN_GIVEN=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --org=*)
+                [ -z "$ORG" ] || die '--org may only be given once'
+                ORG=${1#--org=}
+                ;;
+            --org)
+                shift
+                [ $# -gt 0 ] || die '--org needs an organisation name'
+                [ -z "$ORG" ] || die '--org may only be given once'
+                ORG=$1
+                ;;
+            --yes=*)
+                [ -z "$TOKEN_GIVEN" ] || die '--yes may only be given once'
+                TOKEN_GIVEN=${1#--yes=}
+                ;;
+            --yes)
+                shift
+                [ $# -gt 0 ] || die '--yes needs the token printed by the preview'
+                [ -z "$TOKEN_GIVEN" ] || die '--yes may only be given once'
+                TOKEN_GIVEN=$1
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "unknown option '$1'"
+                ;;
+        esac
+        shift
+    done
+    [ -n "$ORG" ] || die '--org ORG is required'
+    validate_org "$ORG"
+
+    load_owners
+    org_is_member "$ORG" ||
+        die "'$ORG' is not one of your organisations (see: agent-moat owners)"
+
+    gh_read api "orgs/$ORG" --jq '[(.secret_scanning_enabled_for_new_repositories | tostring), (.secret_scanning_push_protection_enabled_for_new_repositories | tostring), (.dependabot_security_updates_enabled_for_new_repositories | tostring)] | @tsv' ||
+        die "could not read the current security defaults for $ORG${GH_ERR:+: $GH_ERR}"
+    CURRENT=$GH_OUT
+    IFS=$(printf '\t') read -r SCAN PUSHPROT DEPBOT <<EOF
+$CURRENT
+EOF
+    case "$SCAN$PUSHPROT$DEPBOT" in
+        *null*) die "GitHub did not report the current security defaults for $ORG; the token probably lacks admin:org (see: agent-moat auth-status)" ;;
+    esac
+
+    if [ "$SCAN" = "true" ] && [ "$PUSHPROT" = "true" ] && [ "$DEPBOT" = "true" ]; then
+        printf '%s: all three security defaults are already enabled for %s; nothing to do\n' "$PROG" "$ORG"
+        exit 0
+    fi
+
+    TOKEN=$({
+        printf 'action\0enable-security-defaults\0'
+        printf 'org\0%s\0' "$ORG"
+        printf 'authenticated-owner\0%s\0' "$AUTH_OWNER"
+        printf 'current\0%s\0' "$CURRENT"
+    } | confirmation_token)
+    [ -n "$TOKEN" ] || die 'failed to compute confirmation token'
+
+    if [ -n "$TOKEN_GIVEN" ]; then
+        if [ "$TOKEN_GIVEN" != "$TOKEN" ]; then
+            printf '%s: token mismatch - the organisation settings changed since the preview.\n' "$PROG" >&2
+            printf '%s: nothing changed. Re-run without --yes for a fresh preview.\n' "$PROG" >&2
+            exit 2
+        fi
+        gh_read api -X PATCH "orgs/$ORG" \
+            -F secret_scanning_enabled_for_new_repositories=true \
+            -F secret_scanning_push_protection_enabled_for_new_repositories=true \
+            -F dependabot_security_updates_enabled_for_new_repositories=true ||
+            die "could not update the security defaults for $ORG${GH_ERR:+: $GH_ERR}"
+        gh_read api "orgs/$ORG" --jq '[(.secret_scanning_enabled_for_new_repositories | tostring), (.secret_scanning_push_protection_enabled_for_new_repositories | tostring), (.dependabot_security_updates_enabled_for_new_repositories | tostring)] | @tsv' ||
+            die "the update ran but the verify read failed${GH_ERR:+: $GH_ERR}; inspect $ORG manually"
+        IFS=$(printf '\t') read -r SCAN PUSHPROT DEPBOT <<EOF
+$GH_OUT
+EOF
+        if [ "$SCAN" = "true" ] && [ "$PUSHPROT" = "true" ] && [ "$DEPBOT" = "true" ]; then
+            printf '%s: secret scanning, push protection and dependabot security updates are now enabled for new repositories in %s\n' "$PROG" "$ORG"
+            printf '%s: note - a later moat run may still show WARN here; that points at the separate Advanced Security Configuration page, which is UI-only\n' "$PROG"
+            exit 0
+        fi
+        die "the update did not stick (now: scanning=$SCAN, push protection=$PUSHPROT, dependabot=$DEPBOT); inspect $ORG manually"
+    fi
+
+    printf '%s - preview only, nothing changed yet\n\n' "$PROG"
+    printf 'organisation:\n    %s\n' "$ORG"
+    printf 'current defaults for NEW repositories:\n'
+    printf '    secret scanning:              %s\n' "$SCAN"
+    printf '    secret push protection:       %s\n' "$PUSHPROT"
+    printf '    dependabot security updates:  %s\n' "$DEPBOT"
+    printf 'proposed:\n'
+    printf '    all three set to true\n'
+    printf 'affects:\n    repositories created in future; existing repositories keep their own settings\n'
+    printf '\nTo apply exactly this change, re-run the same command with:  --yes %s\n' "$TOKEN"
+}
+
+enable_vuln_reporting() {
+    TARGET=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo=*)
+                [ -z "$TARGET" ] || die '--repo may only be given once'
+                TARGET=${1#--repo=}
+                ;;
+            --repo)
+                shift
+                [ $# -gt 0 ] || die '--repo needs OWNER/NAME'
+                [ -z "$TARGET" ] || die '--repo may only be given once'
+                TARGET=$1
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "unknown option '$1'"
+                ;;
+        esac
+        shift
+    done
+    [ -n "$TARGET" ] || die '--repo OWNER/NAME is required'
+    parse_target "$TARGET"
+
+    load_owners
+    owner_is_allowed ||
+        die "owner '$REPO_OWNER' is not the authenticated account or an available organisation"
+
+    # The PUT is idempotent: enabling an already-enabled repository
+    # succeeds. GitHub only supports the feature on public repositories;
+    # visibility is not pre-checked so a refusal shows GitHub's own error.
+    gh_read api -X PUT "repos/$TARGET/private-vulnerability-reporting" ||
+        die "could not enable private vulnerability reporting for '$TARGET'${GH_ERR:+: $GH_ERR}"
+    printf '%s: private vulnerability reporting enabled for %s\n' "$PROG" "$TARGET"
+}
+
+# jq: translate the GET shape of branch protection into the PUT body shape,
+# faithfully. The GET wraps booleans in {enabled} objects and returns users
+# and teams as objects; the PUT wants plain booleans, logins and slugs.
+JQ_GET_TO_PUT='
+def logins: [.[]?.login];
+def slugs: [.[]?.slug];
+{
+  required_status_checks:
+    (if .required_status_checks == null then null else
+      ({strict: (.required_status_checks.strict // false)}
+       + (if ((.required_status_checks.checks // []) | length) > 0
+          then {checks: [.required_status_checks.checks[] | {context: .context, app_id: .app_id}]}
+          else {contexts: (.required_status_checks.contexts // [])} end))
+     end),
+  enforce_admins: (.enforce_admins.enabled // false),
+  required_pull_request_reviews:
+    (if .required_pull_request_reviews == null then null else
+      ({dismiss_stale_reviews: (.required_pull_request_reviews.dismiss_stale_reviews // false),
+        require_code_owner_reviews: (.required_pull_request_reviews.require_code_owner_reviews // false),
+        require_last_push_approval: (.required_pull_request_reviews.require_last_push_approval // false),
+        required_approving_review_count: (.required_pull_request_reviews.required_approving_review_count // 0)}
+       + (if .required_pull_request_reviews.dismissal_restrictions == null then {} else
+           {dismissal_restrictions:
+             {users: (.required_pull_request_reviews.dismissal_restrictions.users | logins),
+              teams: (.required_pull_request_reviews.dismissal_restrictions.teams | slugs),
+              apps:  (.required_pull_request_reviews.dismissal_restrictions.apps  | slugs)}} end)
+       + (if .required_pull_request_reviews.bypass_pull_request_allowances == null then {} else
+           {bypass_pull_request_allowances:
+             {users: (.required_pull_request_reviews.bypass_pull_request_allowances.users | logins),
+              teams: (.required_pull_request_reviews.bypass_pull_request_allowances.teams | slugs),
+              apps:  (.required_pull_request_reviews.bypass_pull_request_allowances.apps  | slugs)}} end))
+     end),
+  restrictions:
+    (if .restrictions == null then null else
+      {users: (.restrictions.users | logins),
+       teams: (.restrictions.teams | slugs),
+       apps:  (.restrictions.apps  | slugs)} end),
+  required_linear_history: (.required_linear_history.enabled // false),
+  allow_force_pushes: (.allow_force_pushes.enabled // false),
+  allow_deletions: (.allow_deletions.enabled // false),
+  block_creations: (.block_creations.enabled // false),
+  required_conversation_resolution: (.required_conversation_resolution.enabled // false),
+  lock_branch: (.lock_branch.enabled // false),
+  allow_fork_syncing: (.allow_fork_syncing.enabled // false),
+  required_signatures: (.required_signatures.enabled // false)
+}'
+
+# jq: apply the requested rules on top of the faithful base. Only ever
+# turns things on or raises the review count; never the reverse.
+JQ_RATCHET='
+.required_signatures = (.required_signatures or $signed)
+| .required_linear_history = (.required_linear_history or $linear)
+| .lock_branch = (.lock_branch or $lock)
+| (if $reviews > 0 then
+    .required_pull_request_reviews =
+      ((.required_pull_request_reviews
+        // {dismiss_stale_reviews: false, require_code_owner_reviews: false,
+            require_last_push_approval: false, required_approving_review_count: 0})
+       | .required_approving_review_count = ([.required_approving_review_count, $reviews] | max))
+   else . end)'
+
+# The PUT body for a branch with no existing protection.
+UNPROTECTED_BASE='{"required_status_checks":null,"enforce_admins":false,"required_pull_request_reviews":null,"restrictions":null,"required_linear_history":false,"allow_force_pushes":false,"allow_deletions":false,"block_creations":false,"required_conversation_resolution":false,"lock_branch":false,"allow_fork_syncing":false,"required_signatures":false}'
+
+protect_branch() {
+    TARGET=""
+    BRANCH=""
+    TOKEN_GIVEN=""
+    SIGNED=false
+    LINEAR=false
+    LOCK=false
+    REVIEWS=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo=*)
+                [ -z "$TARGET" ] || die '--repo may only be given once'
+                TARGET=${1#--repo=}
+                ;;
+            --repo)
+                shift
+                [ $# -gt 0 ] || die '--repo needs OWNER/NAME'
+                [ -z "$TARGET" ] || die '--repo may only be given once'
+                TARGET=$1
+                ;;
+            --branch=*)
+                [ -z "$BRANCH" ] || die '--branch may only be given once'
+                BRANCH=${1#--branch=}
+                ;;
+            --branch)
+                shift
+                [ $# -gt 0 ] || die '--branch needs a branch name'
+                [ -z "$BRANCH" ] || die '--branch may only be given once'
+                BRANCH=$1
+                ;;
+            --require-signed)
+                SIGNED=true
+                ;;
+            --linear-history)
+                LINEAR=true
+                ;;
+            --lock-branch)
+                LOCK=true
+                ;;
+            --require-reviews=*)
+                REVIEWS=${1#--require-reviews=}
+                ;;
+            --require-reviews)
+                shift
+                [ $# -gt 0 ] || die '--require-reviews needs a number (1 to 6)'
+                REVIEWS=$1
+                ;;
+            --yes=*)
+                [ -z "$TOKEN_GIVEN" ] || die '--yes may only be given once'
+                TOKEN_GIVEN=${1#--yes=}
+                ;;
+            --yes)
+                shift
+                [ $# -gt 0 ] || die '--yes needs the token printed by the preview'
+                [ -z "$TOKEN_GIVEN" ] || die '--yes may only be given once'
+                TOKEN_GIVEN=$1
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "unknown option '$1'"
+                ;;
+        esac
+        shift
+    done
+
+    [ -n "$TARGET" ] || die '--repo OWNER/NAME is required'
+    [ -n "$BRANCH" ] || die '--branch NAME is required'
+    [[ "$REVIEWS" =~ ^[0-9]+$ ]] || die "--require-reviews needs a number (1 to 6), not '$REVIEWS'"
+    if [ "$REVIEWS" -gt 6 ]; then
+        die '--require-reviews accepts at most 6'
+    fi
+    if [ "$SIGNED" = "false" ] && [ "$LINEAR" = "false" ] && [ "$LOCK" = "false" ] && [ "$REVIEWS" -eq 0 ]; then
+        die 'nothing to do: pass at least one of --require-signed, --require-reviews N, --linear-history or --lock-branch'
+    fi
+
+    parse_target "$TARGET"
+    validate_branch "$BRANCH"
+    need_jq
+    load_owners
+    owner_is_allowed ||
+        die "owner '$REPO_OWNER' is not the authenticated account or an available organisation"
+
+    BR_ENC=${BRANCH//\//%2F}
+    CURRENT=""
+    if gh_read api "repos/$TARGET/branches/$BR_ENC/protection"; then
+        CURRENT=$GH_OUT
+    else
+        case "$GH_ERR" in
+            *'Branch not protected'*)
+                CURRENT=""
+                ;;
+            *'HTTP 404'*)
+                die "could not read protection for $BRANCH of $TARGET: this needs admin access to the repository (and the branch must exist)"
+                ;;
+            *)
+                die "could not read protection for $BRANCH of $TARGET${GH_ERR:+: $GH_ERR}"
+                ;;
+        esac
+    fi
+
+    if [ -n "$CURRENT" ]; then
+        BASE=$(printf '%s\n' "$CURRENT" | jq "$JQ_GET_TO_PUT") ||
+            die 'could not translate the current protection rules into an update body'
+    else
+        BASE=$UNPROTECTED_BASE
+    fi
+    BODY=$(printf '%s\n' "$BASE" | jq --argjson signed "$SIGNED" --argjson linear "$LINEAR" --argjson lock "$LOCK" --argjson reviews "$REVIEWS" "$JQ_RATCHET") ||
+        die 'could not build the proposed protection body'
+
+    TOKEN=$({
+        printf 'action\0protect-branch\0'
+        printf 'target\0%s\0' "$TARGET"
+        printf 'branch\0%s\0' "$BRANCH"
+        printf 'signed\0%s\0linear\0%s\0reviews\0%s\0lock\0%s\0' "$SIGNED" "$LINEAR" "$REVIEWS" "$LOCK"
+        printf 'authenticated-owner\0%s\0' "$AUTH_OWNER"
+        printf 'current\0%s\0' "${CURRENT:-unprotected}"
+    } | confirmation_token)
+    [ -n "$TOKEN" ] || die 'failed to compute confirmation token'
+
+    if [ -n "$TOKEN_GIVEN" ]; then
+        if [ "$TOKEN_GIVEN" != "$TOKEN" ]; then
+            printf '%s: token mismatch - the branch protection changed since the preview.\n' "$PROG" >&2
+            printf '%s: nothing changed. Re-run without --yes for a fresh preview.\n' "$PROG" >&2
+            exit 2
+        fi
+        gh_read api -X PUT "repos/$TARGET/branches/$BR_ENC/protection" --input - <<EOF ||
+$BODY
+EOF
+            die "could not apply branch protection to $BRANCH of $TARGET${GH_ERR:+: $GH_ERR}"
+        printf '%s: protection applied to %s of %s\n' "$PROG" "$BRANCH" "$TARGET"
+        printf '%s: verify with: agent-moat branch-protection %s %s\n' "$PROG" "$TARGET" "$BRANCH"
+        exit 0
+    fi
+
+    printf '%s - preview only, nothing changed yet\n\n' "$PROG"
+    printf 'repository:\n    %s\n' "$TARGET"
+    printf 'branch:\n    %s\n' "$BRANCH"
+    printf 'current protection:\n'
+    if [ -n "$CURRENT" ]; then
+        printf '%s\n' "$BASE" | jq . | sed 's/^/    /'
+    else
+        printf '    (none - the branch is unprotected)\n'
+    fi
+    printf 'requested rules:\n'
+    [ "$SIGNED" = "true" ] && printf '    require signed commits\n'
+    [ "$REVIEWS" -gt 0 ] && printf '    require %s approving review(s) on pull requests\n' "$REVIEWS"
+    [ "$LINEAR" = "true" ] && printf '    require linear history\n'
+    [ "$LOCK" = "true" ] && printf '    lock the branch (read-only: ALL pushes to it will be blocked)\n'
+    printf 'proposed configuration (the complete body that will replace the current one):\n'
+    printf '%s\n' "$BODY" | jq . | sed 's/^/    /'
+    printf '\nnote: the body above is the current rules plus the requested ones;\nnothing already configured is removed or weakened.\n'
+    printf '\nTo apply exactly this change, re-run the same command with:  --yes %s\n' "$TOKEN"
+}
+
+case "${1:-}" in
+    auth-status)
+        shift
+        [ $# -eq 0 ] || die 'auth-status takes no arguments'
+        need_gh
+        # Nothing is forwarded, so gh's --show-token is unreachable and the
+        # token stays masked. gh's own exit code (1 on auth trouble) is the
+        # exit code of this command.
+        gh auth status
+        ;;
+    owners)
+        shift
+        [ $# -eq 0 ] || die 'owners takes no arguments'
+        print_owners
+        ;;
+    pin-info)
+        shift
+        pin_info "$@"
+        ;;
+    default-branch)
+        shift
+        default_branch "$@"
+        ;;
+    security-policy)
+        shift
+        security_policy "$@"
+        ;;
+    file-check)
+        shift
+        file_check "$@"
+        ;;
+    show-file)
+        shift
+        show_file "$@"
+        ;;
+    org-settings)
+        shift
+        org_settings "$@"
+        ;;
+    two-factor-stragglers)
+        shift
+        two_factor_stragglers "$@"
+        ;;
+    collaborators)
+        shift
+        collaborators_cmd "$@"
+        ;;
+    branch-protection)
+        shift
+        branch_protection "$@"
+        ;;
+    harden-workflow-token)
+        shift
+        harden_workflow_token "$@"
+        ;;
+    enable-security-defaults)
+        shift
+        enable_security_defaults "$@"
+        ;;
+    enable-vuln-reporting)
+        shift
+        enable_vuln_reporting "$@"
+        ;;
+    protect-branch)
+        shift
+        protect_branch "$@"
+        ;;
+    -h|--help)
+        usage
+        ;;
+    '')
+        usage >&2
+        exit 1
+        ;;
+    *)
+        die "unknown command '$1'"
+        ;;
+esac
