@@ -1,6 +1,6 @@
 ---
 name: moat-org-fixer
-description: Apply settings-level security hardening fixes that Laravel's `moat` CLI flags at the org or repo-settings level — org-wide workflow token defaults, secret scanning / push protection / dependabot defaults, branch protection or repository rulesets, per-repo workflow permissions, direct collaborator cleanup. Use when the user has a moat report (or wants to run one) covering an organization and wants to action the settings findings. Prefers `gh api` over Chrome automation for safety and auditability; falls back to chrome-devtools-mcp for UI-only items. File-level fixes inside individual repos belong to the sibling `moat-repo-fixer` skill.
+description: Apply settings-level security hardening fixes that Laravel's `moat` CLI flags at the org or repo-settings level — org-wide workflow token defaults, secret scanning / push protection / dependabot defaults, branch protection or repository rulesets, per-repo workflow permissions, direct collaborator cleanup. Use when the user has a moat report (or wants to run one) covering an organization and wants to action the settings findings. Prefers `gh api` over Chrome automation for safety and auditability; falls back to chrome-devtools-mcp for UI-only items. Also handles Dependabot alert fatigue: enabling the auto-triage rule that auto-dismisses low-impact development-scoped npm alerts, for when users say "too many Dependabot alerts/emails" or "everyone ignores Dependabot". File-level fixes inside individual repos belong to the sibling `moat-repo-fixer` skill.
 ---
 
 # moat-org-fixer
@@ -128,6 +128,7 @@ If moat's `description` or `why_enable` text contains its own caveats, surface t
 | --- | --- |
 | Org-level repository rulesets (`/orgs/<org>/rulesets`) need **GitHub Team or higher**. Free plan returns 403. | Fall back to **per-repo branch protection** (`PUT /repos/<o>/<r>/branches/<b>/protection`). Covers the same four findings (signed, reviews, locked release, linear history), just per-repo instead of cascading. Probe first: `gh api /orgs/<org>/rulesets` — 403 means Free plan. |
 | Advanced Security Configurations on Free plan | Cover public repos only. For private repos on Free, the simple per-new-repo toggles are the best available. List as "plan-tier limitation" in the summary, not a failure. |
+| **Custom** Dependabot auto-triage rules on org-owned repos need **GitHub Code Security** | The GitHub-maintained preset rule ("Dismiss low impact issues for development-scoped dependencies") needs no licence: on by default for public repos, opt-in for private ones. See the auto-triage section below. |
 | Pre-defined org **roles** are *not* gated like rulesets | The five `all_repo_*` roles (read/triage/write/maintain/admin) **ARE assignable on GitHub Free** (verified on a real run) — only *custom* org roles need Enterprise Cloud. They're the clean way to give a team all-repo access; see **Direct collaborators** for the commands and caveats. Don't assume "Free = no org roles" the way rulesets are blocked. |
 
 ## Step 5: Walk through each finding
@@ -239,6 +240,23 @@ gh api -X DELETE /repos/<owner>/<repo>/private-vulnerability-reporting
 PUT/DELETE return an empty body on success — verify with the GET. Batch across the affected repos like the other per-repo fixes.
 
 **Self-inflicted-failure gotcha:** a *newly created* repo does **not** reliably inherit the org PVR default. If you create a repo as part of these fixes — e.g. a `<org>/.github` repo to hold a default `SECURITY.md` — it can surface as a fresh `private_vulnerability_reporting` failure on the next scan (and bumps the repo count, e.g. 67→68). Enable PVR on any repo you create, then re-check.
+
+### Proactive: Dependabot alert noise via auto-triage rules (not a moat finding)
+
+Not something moat checks, and applying it moves no moat count: say so up front. Offer it when the user complains of Dependabot **alert** fatigue. The classic case is a fleet of Laravel/Vite apps where npm exists only to build assets, so a stream of dev-scoped alerts about build-chain packages trains everyone to ignore the alerts tab and the emails, which is exactly how a genuine alert gets missed.
+
+**Alerts are not `dependabot.yml`.** Alerts come from GitHub's dependency graph and fire regardless of what `.github/dependabot.yml` tracks. Trimming that file (the repo-fixer's mirror-aware Dependabot fix) stops version-bump *PRs* but not a single alert. The alert-side lever is an **auto-triage rule**.
+
+**Reach for GitHub's preset rule first**: "Dismiss low impact issues for development-scoped dependencies". It is GitHub-maintained, **npm only**, and auto-dismisses alerts that are both *development-scoped* and *low-impact* (CWE classes unlikely to be exploitable outside a dev/build environment: resource management, slow builds, that sort of thing). Enabled by default on public repos; **opt-in for private repos**. The impact filter is the important half: in a stock Laravel app *everything* npm is a devDependency, including packages Vite bundles into the shipped JavaScript (axios, for one), so a blanket "dismiss all dev-scope" custom rule would also silence genuinely shipped code. The preset's low-impact restriction keeps serious vulnerabilities in bundled packages alerting. Auto-dismissed alerts stop notifying and leave the open list; they stay visible under the closed/auto-dismissed filters, and the dismissal activity surfaces in alert webhooks, the REST/GraphQL alert APIs and the audit log.
+
+**Custom rules are the finer-grained fallback** (target severity, scope, package name, CWE, ecosystem), for non-npm ecosystems or unusual needs. Plan gate: custom rules on org-owned repos need GitHub Code Security (see *Plan-tier limitations*); the preset needs no licence.
+
+**No management API (checked Aug 2026).** Creating or enabling auto-triage rules is UI-only: the REST/GraphQL surface exposes the resulting dismissal activity on alerts, not the rules themselves, so there is nothing for `gh api` to call. In apply mode this goes down the *Chrome fallback* path; in hand-off mode give the click path:
+
+> Repo level: repo Settings, code security page (historically `https://github.com/<owner>/<repo>/settings/security_analysis`), Dependabot section, "Auto-triage rules".
+> Org level: org Settings, code security section (`https://github.com/organizations/<org>/settings/security_analysis`), where rules can be enabled and enforced across the org's repos.
+>
+> GitHub reshuffles these settings pages (the Advanced Security rename moved several), so treat the URLs as starting points: if one 404s or the page lacks the rules control, navigate from Settings rather than guessing, and per the Chrome-fallback rule stop and surface anything unexpected.
 
 ### Branch protection / rulesets
 

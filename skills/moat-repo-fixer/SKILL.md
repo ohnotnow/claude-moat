@@ -213,19 +213,33 @@ For every `.github/workflows/*.yml`:
    - `.github/workflows/*.yml` → `github-actions` (almost always present, include unconditionally if `.github/workflows` exists)
 
    **Look in subdirectories, not just the repo root.** A monorepo buries ecosystems one level down — a Go CLI at `cli/go.mod` inside a Laravel app, a frontend at `web/package.json`. Detect marker files wherever they live (e.g. `find . -name go.mod -not -path '*/vendor/*' -not -path '*/node_modules/*'`) and set each Dependabot entry's `directory:` to the **directory of the marker** (`/cli`, not `/`). Root-only detection silently misses these — and they're often the components that ship binaries, so they matter most.
-2. Pick the closest starting template from `assets/dependabot/`:
+2. **Ask where development actually happens, before picking a template.** Version-update PRs are only worth raising on a platform where someone will merge them. So ask: is GitHub the *primary* development platform for this repo, or a *mirror*: a disaster-recovery copy or push-mirror of a repo whose real home is elsewhere (an on-prem GitLab is the common case)? A GitLab delivery target (see *Delivery* / *Mode B*) is a strong tell for "mirror"; offer it as the likely answer rather than asking cold.
+   - **Primary**: carry on to step 3 as normal.
+   - **Mirror**: use `base.yml` (github-actions only) **regardless of what step 1 detected**. Composer/npm version-bump PRs on a mirror never get merged: they pile up by the hundred and train developers to tune Dependabot out entirely, which is exactly how a real alert gets missed. `github-actions` stays because workflows genuinely execute on GitHub even when it is a mirror, and the SHA-pinned actions from the pinning fix need Dependabot to raise their bumps. Prepend this comment to the generated file so a future maintainer doesn't "helpfully" restore the missing ecosystems:
+
+     ```yaml
+     # GitHub is a mirror/DR platform for this repo. Development happens elsewhere,
+     # so composer/npm version-update PRs would never be merged here and are
+     # deliberately absent. github-actions IS tracked: workflows really run on
+     # GitHub, and the SHA-pinned actions need automated bump PRs. Security
+     # alerts are unaffected by this file; dependency freshness is the primary
+     # platform's job (e.g. a composer-audit gate in its CI).
+     ```
+
+   Two things to say plainly in the mirror case rather than letting the user infer them. First, security **alerts** are untouched by this file: they come from the dependency graph, not `dependabot.yml`, so if dev-scoped npm alert noise is the real complaint, that is an auto-triage rule (settings-level, so hand off to `moat-org-fixer` and name it in the closing summary). Second, dependency freshness is now entirely the primary platform's job (e.g. `composer audit` failing the build in GitLab CI): check with the user that something over there is genuinely doing it.
+3. Pick the closest starting template from `assets/dependabot/`:
    - `laravel.yml` — composer + npm + github-actions (full Laravel app)
    - `php-package.yml` — composer + github-actions (PHP library)
-   - `base.yml` — github-actions only
-3. Add/remove ecosystems to match what you actually detected.
-4. **Include a `cooldown` per ecosystem.** This is the automated-PR twin of the per-ecosystem release-age cooldown (see *Supply-chain hardening* below) — it stops Dependabot raising PRs for day-zero releases. The bundled templates already carry one:
+   - `base.yml` — github-actions only (also the mirror pick, step 2)
+4. Add/remove ecosystems to match what you actually detected.
+5. **Include a `cooldown` per ecosystem.** This is the automated-PR twin of the per-ecosystem release-age cooldown (see *Supply-chain hardening* below) — it stops Dependabot raising PRs for day-zero releases. The bundled templates already carry one:
    ```yaml
        cooldown:
          default-days: 7
    ```
    Why `7` here when the `.npmrc` uses `1`? The meaningful value is schedule-dependent: with `interval: weekly`, a 1-day cooldown rarely changes anything (most releases are already older than a day by the weekly run), whereas ~7 days actually dodges a freshly-poisoned release. Different layer, different sensible number — same goal. Cooldown applies to version updates only (not security updates) and accepts 1–90 days; tune `default-days` (and optionally the `semver-major-days` / `-minor-days` / `-patch-days` split) to taste.
-5. Write to `.github/dependabot.yml`. Preview, confirm.
-6. If `.github/dependabot.yml` already exists, diff the proposed against the existing and let the user decide what to merge.
+6. Write to `.github/dependabot.yml`. Preview, confirm.
+7. If `.github/dependabot.yml` already exists, diff the proposed against the existing and let the user decide what to merge.
 
 **Check existence robustly, and cross-check GitHub when moat disagrees with you.** Test the path on its own (`test -f .github/dependabot.yml`) rather than folding it into a combined `ls a b c 2>/dev/null || echo none` — a combined `ls` exits non-zero if *any* listed file is missing, so the `|| echo none` fires even when the file is present and you can end up believing it's absent when it isn't. And if moat **passes** `repositories_have_dependabot_config` while you think there's no local file (or vice-versa), don't carry the contradiction: that's a tell your local tree and GitHub's scanned branch have diverged. Cross-check what GitHub actually serves — the same habit the `SECURITY.md` fix uses below:
 

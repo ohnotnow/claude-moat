@@ -25,7 +25,7 @@ Three Claude Code skills, living under `skills/`. The first two apply fixes - on
 Handles in-repository, file-level fixes from a moat report. Run it inside the repository you want to harden. It walks through each finding one at a time, previewing the change before applying it. Covered fixes:
 
 - Pinning GitHub Actions in workflow YAML to full commit SHAs, keeping the original tag as an inline comment.
-- Generating a `dependabot.yml` config tailored to the detected ecosystem (composer, npm, github-actions, etc.), including a `cooldown` so Dependabot will not raise PRs for day-zero releases.
+- Generating a `dependabot.yml` config tailored to the detected ecosystem (composer, npm, github-actions, etc.), including a `cooldown` so Dependabot will not raise PRs for day-zero releases. It asks first whether GitHub is the primary development platform or a disaster-recovery mirror: a mirror gets a github-actions-only config, because composer/npm bump PRs that nobody will ever merge just pile up and teach developers to tune Dependabot out.
 - Adding a `SECURITY.md` from a template, with `git config` values offered as attribution defaults.
 - Adding per-workflow `permissions: contents: read` to restrict the workflow token.
 
@@ -73,6 +73,7 @@ Handles organisation-level and repository-settings fixes via `gh api` (or the `a
 - Leverage-ordered walkthrough. Org-wide settings first, then per-repo, with a recommended `moat` re-run between groups so per-repo failures that cascade from the org defaults clear themselves before you grind through them by hand.
 - Known-traps section, written up from real-world testing. The two-factor auth PATCH that returns 200 without changing anything, the workflow-permissions endpoint that needs PUT rather than PATCH, and the FAIL-to-WARN downgrade pattern after enabling simple toggles.
 - Friction warnings on high-impact findings. Signed commits, 2FA enforcement and locked release branches all get an explicit "here is what this breaks for your developers" note before the confirm step.
+- An opt-in Dependabot alert-noise fix, beyond moat's own findings: enabling GitHub's preset auto-triage rule that auto-dismisses low-impact alerts on development-scoped npm dependencies, for teams drowning in alerts about build-only front-end packages. Auto-triage rules have no management API, so this goes down the Chrome DevTools path or a documented click path.
 - A structured closing summary. Separate sections for UI follow-up (with exact paths and click sequences), user-skipped findings (with re-enable instructions), sibling-skill territory and plan-tier limitations.
 
 Every successful run ends with a reminder to revoke the elevated scopes via `gh auth logout` and the [GitHub CLI authorisation page](https://github.com/settings/applications). An `admin:org` scope sitting in your shell config is exactly the kind of credential moat itself exists to flag.
@@ -106,6 +107,19 @@ The header comment of the script is the full contract, including what is deliber
 Both skills check for the wrapper (`command -v agent-moat`) and prefer it when present, falling back to plain `gh` when not - installing it is optional.
 
 It needs `bash` 3.2+, an authenticated `gh`, `git` (only to compute the confirmation tokens) and `jq` (only for `protect-branch`).
+
+If you choose to use the wrapper - you can lock down `gh` calls in your agents settings to block it calling direct.  Eg, for claude code `~/claude/settings.json` :
+
+```json
+{
+  "permissions": {
+      "deny": [
+        "Bash(gh *)",
+        ...
+      ]
+  }
+}
+```
 
 ## How it was built
 
